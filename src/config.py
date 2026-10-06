@@ -88,6 +88,7 @@ USE_MLM_HEAD = True
 #                  vocabulary readout instead of noise.
 # Both are a plain Linear and both train; pick by validation macro-F1.
 READOUT_INIT = 'random'
+READOUT_INITS = ('random', 'verbalizer')
 
 # Freeze the backbone except the last N encoder blocks; 0 freezes everything.
 UNFREEZE_LAYERS = 2
@@ -105,6 +106,13 @@ SPLIT_SEED = 42
 WEIGHT_DECAY = 0.01
 
 BEST_WEIGHTS = os.path.join(WEIGHTS_DIR, 'best_mmbert_stereotype_prompt.pt')
+
+
+def best_weights_path(readout_init: str = READOUT_INIT) -> str:
+    """Checkpoint path names the readout init, so 'random' and 'verbalizer' runs
+    do not overwrite each other. Training and prediction both resolve through
+    this, so passing the same --readout-init at both stages lines them up."""
+    return os.path.join(WEIGHTS_DIR, f'best_mmbert_stereotype_prompt_{readout_init}.pt')
 
 
 # -----------------------------------------------------------------------------

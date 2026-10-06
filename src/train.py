@@ -16,6 +16,7 @@ import sys
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 
@@ -25,7 +26,6 @@ import data as data_mod
 from config import (
     BACKBONE_LR,
     BATCH_SIZE,
-    BEST_WEIGHTS,
     HEAD_LR,
     LABEL_CLASSES,
     MAX_EPOCHS,
@@ -39,6 +39,7 @@ from config import (
     USE_MLM_HEAD,
     VAL_FRACTION,
     WEIGHT_DECAY,
+    best_weights_path,
 )
 from model import (
     label_token_ids,
@@ -50,7 +51,7 @@ from model import (
 )
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--model-name', default=MMBERT_MODEL_NAME)
     parser.add_argument('--languages', nargs='*', default=None, help='Subset of EN/IT/NL (default: all)')
@@ -68,11 +69,22 @@ def parse_args():
                              '(pretrained decoder rows for the label words)')
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
-    parser.add_argument('--out', default=BEST_WEIGHTS)
+    parser.add_argument('--out', default=None,
+                        help='Checkpoint path (default: weights/best_mmbert_stereotype_prompt_<readout>.pt)')
+    parser.add_argument('--history', default=None,
+                        help='CSV for per-epoch metrics (default: <out>_history.csv)')
     parser.add_argument('--seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--device', default=None, help='cuda | cpu (default: auto)')
     parser.add_argument('--evaluate-only', action='store_true', help='Load --out and report val metrics only')
-    return parser.parse_args()
+
+    args = parser.parse_args(argv)
+    # Resolved here rather than as argparse defaults because both depend on
+    # --readout-init, which argparse cannot see when setting defaults.
+    if args.out is None:
+        args.out = best_weights_path(args.readout_init)
+    if args.history is None:
+        args.history = os.path.splitext(args.out)[0] + '_history.csv'
+    return args
 
 
 def set_seed(seed: int) -> None:
@@ -99,30 +111,66 @@ def build_optimizer(model, head_lr, backbone_lr, weight_decay):
 
 
 @torch.no_grad()
-def predict(model, loader, device):
-    """Returns (class indices, yes-probabilities, true labels)."""
+def collect(model, loader, device, criterion=None):
+    """One pass over a loader. Evaluates even while the model is in train mode.
+
+    Returns preds, probs, labels and the mean loss (nan when no criterion is
+    given). Used by both predict() and evaluate() so inference happens once per
+    call rather than once per metric.
+    """
     model.eval()
-    preds, probs, labels = [], [], []
+    preds, probs, labels, losses = [], [], [], []
     for input_ids, mask, label, mask_pos in loader:
         logits = model(input_ids.to(device), mask.to(device), mask_pos.to(device))
-        yes_index = LABEL_CLASSES.index('yes')
-        probs.append(torch.softmax(logits, dim=1)[:, yes_index].cpu().numpy())
+        if criterion is not None:
+            losses.append(float(criterion(logits, label.to(device))))
+        probs.append(torch.softmax(logits, dim=1).cpu().numpy())
         preds.append(logits.argmax(dim=1).cpu().numpy())
         labels.append(label.numpy())
-    return np.concatenate(preds), np.concatenate(probs), np.concatenate(labels)
+    return {
+        'preds': np.concatenate(preds),
+        'probs': np.concatenate(probs),
+        'labels': np.concatenate(labels),
+        'loss': float(np.mean(losses)) if losses else float('nan'),
+    }
 
 
-def evaluate(model, loader, device):
+def predict(model, loader, device):
+    """Returns (class indices, yes-probabilities, true labels)."""
+    out = collect(model, loader, device)
+    return out['preds'], out['probs'], out['labels']
+
+
+def metrics_from(preds, labels, loss=float('nan')):
     from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-    preds, _, labels = predict(model, loader, device)
     return {
+        'loss': loss,
         'acc': accuracy_score(labels, preds),
         'macro_f1': f1_score(labels, preds, average='macro', zero_division=0),
         'f1_yes': f1_score(labels, preds, pos_label=1, zero_division=0),
         'precision_yes': precision_score(labels, preds, pos_label=1, zero_division=0),
         'recall_yes': recall_score(labels, preds, pos_label=1, zero_division=0),
     }
+
+
+def evaluate(model, loader, device, criterion=None):
+    out = collect(model, loader, device, criterion)
+    return metrics_from(out['preds'], out['labels'], out['loss'])
+
+
+def format_confusion_matrix(labels, preds):
+    """2x2 matrix as text, rows = truth, columns = prediction. yes is positive."""
+    from sklearn.metrics import confusion_matrix
+
+    cm = confusion_matrix(labels, preds, labels=[0, 1])
+    tn, fp, fn, tp = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
+    return '\n'.join([
+        '              pred no  pred yes',
+        f'  true no    {tn:>8} {fp:>9}',
+        f'  true yes   {fn:>8} {tp:>9}',
+        f'  (tn={tn} fp={fp} fn={fn} tp={tp})',
+    ])
 
 
 def print_metrics(metrics, name='VALIDATION'):
@@ -135,9 +183,11 @@ def evaluate_per_language(model, df, tokenizer, args, device):
     print('--- PER LANGUAGE ---')
     for lang in sorted(df['lang'].unique()):
         subset = df[df['lang'] == lang].reset_index(drop=True)
-        _, loader = data_mod.build_loaders(subset, subset, tokenizer, args.batch_size, args.max_len)
-        metrics = evaluate(model, loader, device)
+        loader = data_mod.build_inference_loader(subset, tokenizer, args.batch_size, args.max_len)
+        out = collect(model, loader, device)
+        metrics = metrics_from(out['preds'], out['labels'], out['loss'])
         print(f"  [{lang}] acc {metrics['acc']:.4f} | macro_f1 {metrics['macro_f1']:.4f}")
+        print(format_confusion_matrix(out['labels'], out['preds']))
 
 
 def main():
@@ -179,12 +229,15 @@ def main():
 
     best_score = -1.0
     epochs_without_improvement = 0
+    history = []
 
     for epoch in range(1, args.epochs + 1):
         started = time.time()
         sampler.set_epoch(epoch)
         model.train()
         running_loss = 0.0
+        running_correct = 0
+        seen = 0
 
         for input_ids, mask, label, mask_pos in train_loader:
             optimizer.zero_grad()
@@ -195,14 +248,31 @@ def main():
             optimizer.step()
             running_loss += loss.item()
 
+            # Training-set accuracy comes from the same forward pass, so it costs
+            # nothing extra. It is computed with dropout still on, hence slightly
+            # pessimistic; use it only to spot underfitting, not to rank runs.
+            running_correct += int((logits.argmax(dim=1) == label.to(device)).sum())
+            seen += label.size(0)
+
         train_loss = running_loss / max(len(train_loader), 1)
-        metrics = evaluate(model, val_loader, device)
+        train_acc = running_correct / max(seen, 1)
+        metrics = evaluate(model, val_loader, device, criterion)
         val_score = metrics['macro_f1']
+
+        history.append({
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': metrics['loss'],
+            'val_macro_f1': metrics['macro_f1'],
+            'val_acc': metrics['acc'],
+            'seconds': round(time.time() - started, 1),
+        })
 
         print(
             f"Epoch {epoch:>3}/{args.epochs} | train_loss {train_loss:.4f} | "
-            f"val_macro_f1 {metrics['macro_f1']:.4f} | val_acc {metrics['acc']:.4f} | "
-            f"{time.time() - started:.0f}s"
+            f"val_loss {metrics['loss']:.4f} | val_macro_f1 {metrics['macro_f1']:.4f} | "
+            f"val_acc {metrics['acc']:.4f} | {time.time() - started:.0f}s"
         )
 
         if val_score > best_score + 1e-4:
@@ -216,8 +286,15 @@ def main():
                 print(f'Early stopping after {epoch} epochs (no improvement for {args.patience})')
                 break
 
+    history_df = pd.DataFrame(history)
+    history_df.to_csv(args.history, index=False, encoding='utf-8')
+    print(f'\nWrote {len(history_df)} epoch(s) of metrics to {args.history}')
+
     load_model_weights(model, args.out, device=device)
-    print_metrics(evaluate(model, val_loader, device), 'VALIDATION (best checkpoint)')
+    print_metrics(evaluate(model, val_loader, device, criterion), 'VALIDATION (best checkpoint)')
+    best = collect(model, val_loader, device, criterion)
+    print('--- CONFUSION MATRIX (best checkpoint) ---')
+    print(format_confusion_matrix(best['labels'], best['preds']))
     evaluate_per_language(model, df_val, tokenizer, args, device)
 
 

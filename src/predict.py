@@ -17,16 +17,17 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import data as data_mod
-from config import BEST_WEIGHTS, MAX_LEN, MMBERT_MODEL_NAME, READOUT_INIT, READOUT_INITS, USE_MLM_HEAD
+from config import MAX_LEN, MMBERT_MODEL_NAME, READOUT_INIT, READOUT_INITS, USE_MLM_HEAD, best_weights_path
 from model import load_model, load_model_weights, load_tokenizer
-from train import evaluate, predict, print_metrics, resolve_device
+from train import collect, format_confusion_matrix, metrics_from, print_metrics, resolve_device
 
 OUTPUT_COLUMNS = ['StereoQueerEval_id', 'lang', 'stereotype_pred', 'p_yes']
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--weights', default=BEST_WEIGHTS)
+    parser.add_argument('--weights', default=None,
+                        help='Checkpoint (default: weights/best_mmbert_stereotype_prompt_<readout>.pt)')
     parser.add_argument('--model-name', default=MMBERT_MODEL_NAME)
     parser.add_argument('--input', default=None, help='TSV to score; defaults to all training languages')
     parser.add_argument('--out', default='predictions.csv')
@@ -37,7 +38,11 @@ def parse_args():
                         help="Must match the value used at training time")
     parser.add_argument('--device', default=None)
     parser.add_argument('--eval-only', action='store_true', help='Metrics only, do not write a CSV')
-    return parser.parse_args()
+
+    args = parser.parse_args(argv)
+    if args.weights is None:
+        args.weights = best_weights_path(args.readout_init)
+    return args
 
 
 def main():
@@ -65,8 +70,13 @@ def main():
     # forward pass regardless of what runs next.
     model.eval()
 
-    preds, probs, _ = predict(model, loader, device)
-    print_metrics(evaluate(model, loader, device), f'INPUT ({len(df)} rows)')
+    # A single pass gives both the predictions for the CSV and the metrics; the
+    # criterion is None so metrics contains loss=nan.
+    out = collect(model, loader, device)
+    preds, probs, labels = out['preds'], out['probs'], out['labels']
+    print_metrics(metrics_from(preds, labels, out['loss']), f'INPUT ({len(df)} rows)')
+    print('--- CONFUSION MATRIX ---')
+    print(format_confusion_matrix(labels, preds))
 
     if args.eval_only:
         return
