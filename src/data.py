@@ -230,23 +230,35 @@ class StereoQueerDataset(Dataset):
             str(p).replace(SEP_TOKEN, tokenizer.sep_token).replace(MASK_LABEL, tokenizer.mask_token)
             for p in prompts
         ]
-        encoded = tokenizer(prompts, truncation=True, max_length=max_len, padding=False)
-        self.input_ids = encoded['input_ids']
-        self.attention_mask = encoded['attention_mask']
 
-        # Truncation cuts the tail, where the slot lives, so an overflowing prompt
-        # silently loses it. And a stray mask marker inside the comment would be
-        # picked up by a first-match search. Both cases mean the prompt is not the
-        # single-slot prompt this model expects, so fail loudly rather than read
-        # the wrong position.
+        # Tokenize without truncation first. The word-based budget is only an
+        # estimate: the real tokenizer can still produce more tokens than max_len
+        # for a small minority of prompts. Right-truncation would cut the tail of
+        # the sequence, which is exactly where the slot lives, so such prompts are
+        # left-truncated instead — a prompt over budget keeps its last max_len
+        # tokens, i.e. the question, the slot, and as much of the comment as fits.
+        full = tokenizer(prompts, truncation=False, padding=False)
+        self.input_ids = [
+            ids[-max_len:] if len(ids) > max_len else ids
+            for ids in full['input_ids']
+        ]
+        self.attention_mask = [
+            [1] * len(ids)
+            for ids in self.input_ids
+        ]
+
+        # The prompt must contain exactly one slot. Left-truncation keeps the
+        # mask (it sits at the end), so a wrong count here means a stray marker
+        # slipped through cleaning, or a tokenizer that moved the mask — fail
+        # loudly rather than read the wrong position.
         self.mask_positions = []
         for i, ids in enumerate(self.input_ids):
             occurrences = [j for j, token in enumerate(ids) if token == mask_token_id]
             if len(occurrences) != 1:
                 raise ValueError(
                     f'Prompt {i} has {len(occurrences)} {MASK_LABEL} tokens; expected exactly 1 '
-                    f'(max_len={max_len}). Truncation can remove the slot, and text containing a '
-                    'literal mask marker adds extra ones. Render with a smaller max_len.'
+                    f'(max_len={max_len}). A literal mask marker inside the comment, or an '
+                    'unusual tokenizer, can break the single-slot invariant.'
                 )
             self.mask_positions.append(occurrences[0])
         self.labels = torch.as_tensor(np.array(labels, dtype=np.int64))
