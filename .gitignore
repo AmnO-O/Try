@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Artifacts
+weights/
+*.pt
+*.pkl
+*.tsv
+*.csv
+.env
+.ipynb_checkpoints/
