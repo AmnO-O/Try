@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -54,6 +55,29 @@ from model import (
 )
 
 
+def _warmup_batch_size(epoch, final_bs, start_bs, warmup_epochs):
+    """Linear ramp from `start_bs` at epoch 1 to `final_bs` at the last warmup
+    epoch, then flat at the final size. Returns `final_bs` when disabled."""
+    if start_bs is None or start_bs >= final_bs or warmup_epochs < 1:
+        return final_bs
+    denom = max(warmup_epochs - 1, 1)
+    t = min(epoch - 1, denom) / denom
+    return max(1, int(round(start_bs + (final_bs - start_bs) * t)))
+
+
+def _reload_batch_size(loader, batch_size, pad_token_id):
+    """Re-chunk the same (epoch-seeded) sampler at a new batch size. The sampler
+    emits a flat index order, so re-batching keeps the exact same within-epoch
+    sequence while changing how many rows each weight update sees."""
+    return DataLoader(
+        loader.dataset,
+        batch_size=batch_size,
+        sampler=loader.sampler,
+        collate_fn=lambda batch: data_mod.collate(batch, pad_token_id),
+        drop_last=True,
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--model-name', default=MMBERT_MODEL_NAME)
@@ -83,6 +107,12 @@ def parse_args(argv=None):
                         help='CSV for per-epoch metrics (default: <out>_history.csv)')
     parser.add_argument('--seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--device', default=None, help='cuda | cpu (default: auto)')
+    parser.add_argument('--warmup-batch-size', type=int, default=None,
+                        help='Batch size for the first epoch, linearly ramping to --batch-size over '
+                             '--warmup-epochs. Small batches update weights more often early on '
+                             "(ModernBERT's trick); default: off")
+    parser.add_argument('--warmup-epochs', type=int, default=2,
+                        help='Epochs spanned by the batch-size ramp (default 2)')
     parser.add_argument('--no-amp', action='store_true',
                         help='Disable mixed precision (default: fp16 autocast on CUDA)')
     parser.add_argument('--evaluate-only', action='store_true', help='Load --out and report val metrics only')
@@ -94,6 +124,11 @@ def parse_args(argv=None):
         args.out = best_weights_path(args.readout_init)
     if args.history is None:
         args.history = os.path.splitext(args.out)[0] + '_history.csv'
+    if args.warmup_batch_size is not None:
+        if args.warmup_batch_size <= 0:
+            parser.error('--warmup-batch-size must be >= 1')
+        if args.warmup_batch_size >= args.batch_size:
+            args.warmup_batch_size = None  # nothing to warm up to
     return args
 
 
@@ -233,6 +268,11 @@ def main():
         df_train, df_val, tokenizer, args.batch_size, args.max_len, args.seed
     )
     sampler = train_loader.sampler
+    pad_token_id = tokenizer.pad_token_id
+
+    if args.warmup_batch_size is not None:
+        print(f'Batch-size warmup: {args.warmup_batch_size} -> {args.batch_size} '
+              f'over {args.warmup_epochs} epoch(s)')
 
     model = load_model(
         args.model_name,
@@ -262,6 +302,9 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         started = time.time()
+        epoch_bs = _warmup_batch_size(epoch, args.batch_size, args.warmup_batch_size, args.warmup_epochs)
+        if epoch_bs != train_loader.batch_size:
+            train_loader = _reload_batch_size(train_loader, epoch_bs, pad_token_id)
         sampler.set_epoch(epoch)
         model.train()
         running_loss = 0.0
