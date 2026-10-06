@@ -14,6 +14,7 @@ import os
 import random
 import sys
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
@@ -75,6 +76,8 @@ def parse_args(argv=None):
                         help='CSV for per-epoch metrics (default: <out>_history.csv)')
     parser.add_argument('--seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--device', default=None, help='cuda | cpu (default: auto)')
+    parser.add_argument('--no-amp', action='store_true',
+                        help='Disable mixed precision (default: fp16 autocast on CUDA)')
     parser.add_argument('--evaluate-only', action='store_true', help='Load --out and report val metrics only')
 
     args = parser.parse_args(argv)
@@ -101,6 +104,25 @@ def resolve_device(name):
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+def autocast_ctx(device, enabled: bool):
+    """CUDA mixed-precision context, or a no-op when disabled or on CPU.
+
+    mmBERT is 300M+ params; fp32 on a T4 runs on plain CUDA cores (~8 TFLOPS)
+    while fp16 uses tensor cores (~65 TFLOPS), so AMP typically cuts epoch time
+    by 3-5x. Only the forward+loss runs under autocast; weights stay fp32.
+    """
+    if enabled and device.type == 'cuda':
+        return torch.autocast(device_type='cuda', dtype=torch.float16)
+    return nullcontext()
+
+
+def make_scaler(enabled: bool):
+    try:
+        return torch.amp.GradScaler('cuda', enabled=enabled)  # torch >= 2.0
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=enabled)     # fallback
+
+
 def build_optimizer(model, head_lr, backbone_lr, weight_decay):
     """Encoder params (if unfrozen) get a smaller LR than the fresh-ish head."""
     encoder_params, head_params = trainable_parameter_groups(model)
@@ -111,20 +133,21 @@ def build_optimizer(model, head_lr, backbone_lr, weight_decay):
 
 
 @torch.no_grad()
-def collect(model, loader, device, criterion=None):
+def collect(model, loader, device, criterion=None, use_amp: bool = False):
     """One pass over a loader. Evaluates even while the model is in train mode.
 
     Returns preds, probs, labels and the mean loss (nan when no criterion is
-    given). Used by both predict() and evaluate() so inference happens once per
-    call rather than once per metric.
+    given). Used by both predict() and evaluate() so computation happens once
+    per call rather than once per metric.
     """
     model.eval()
     preds, probs, labels, losses = [], [], [], []
     for input_ids, mask, label, mask_pos in loader:
-        logits = model(input_ids.to(device), mask.to(device), mask_pos.to(device))
-        if criterion is not None:
-            losses.append(float(criterion(logits, label.to(device))))
-        probs.append(torch.softmax(logits, dim=1).cpu().numpy())
+        with autocast_ctx(device, use_amp):
+            logits = model(input_ids.to(device), mask.to(device), mask_pos.to(device))
+            if criterion is not None:
+                losses.append(float(criterion(logits, label.to(device))))
+        probs.append(torch.softmax(logits.float(), dim=1).cpu().numpy())
         preds.append(logits.argmax(dim=1).cpu().numpy())
         labels.append(label.numpy())
     return {
@@ -133,12 +156,6 @@ def collect(model, loader, device, criterion=None):
         'labels': np.concatenate(labels),
         'loss': float(np.mean(losses)) if losses else float('nan'),
     }
-
-
-def predict(model, loader, device):
-    """Returns (class indices, yes-probabilities, true labels)."""
-    out = collect(model, loader, device)
-    return out['preds'], out['probs'], out['labels']
 
 
 def metrics_from(preds, labels, loss=float('nan')):
@@ -154,8 +171,8 @@ def metrics_from(preds, labels, loss=float('nan')):
     }
 
 
-def evaluate(model, loader, device, criterion=None):
-    out = collect(model, loader, device, criterion)
+def evaluate(model, loader, device, criterion=None, use_amp: bool = False):
+    out = collect(model, loader, device, criterion, use_amp=use_amp)
     return metrics_from(out['preds'], out['labels'], out['loss'])
 
 
@@ -179,12 +196,12 @@ def print_metrics(metrics, name='VALIDATION'):
         print(f'  {key}: {value:.4f}')
 
 
-def evaluate_per_language(model, df, tokenizer, args, device):
+def evaluate_per_language(model, df, tokenizer, args, device, use_amp: bool = False):
     print('--- PER LANGUAGE ---')
     for lang in sorted(df['lang'].unique()):
         subset = df[df['lang'] == lang].reset_index(drop=True)
         loader = data_mod.build_inference_loader(subset, tokenizer, args.batch_size, args.max_len)
-        out = collect(model, loader, device)
+        out = collect(model, loader, device, use_amp=use_amp)
         metrics = metrics_from(out['preds'], out['labels'], out['loss'])
         print(f"  [{lang}] acc {metrics['acc']:.4f} | macro_f1 {metrics['macro_f1']:.4f}")
         print(format_confusion_matrix(out['labels'], out['preds']))
@@ -194,7 +211,8 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)
-    print(f'Device: {device}')
+    use_amp = not args.no_amp and device.type == 'cuda'
+    print(f'Device: {device} | mixed precision: {"ON (fp16)" if use_amp else "off"}')
 
     df_all = data_mod.load_frame(languages=args.languages, max_len=args.max_len)
     df_train, df_val = data_mod.split_by_video(df_all, args.val_fraction, args.split_seed)
@@ -220,12 +238,14 @@ def main():
 
     if args.evaluate_only:
         load_model_weights(model, args.out, device=device)
-        print_metrics(evaluate(model, val_loader, device), f'VALIDATION (loaded {args.out})')
-        evaluate_per_language(model, df_val, tokenizer, args, device)
+        print_metrics(evaluate(model, val_loader, device, use_amp=use_amp),
+                      f'VALIDATION (loaded {args.out})')
+        evaluate_per_language(model, df_val, tokenizer, args, device, use_amp=use_amp)
         return
 
     criterion = nn.CrossEntropyLoss()
     optimizer = build_optimizer(model, args.head_lr, args.backbone_lr, args.weight_decay)
+    scaler = make_scaler(use_amp)
 
     best_score = -1.0
     epochs_without_improvement = 0
@@ -241,22 +261,31 @@ def main():
 
         for input_ids, mask, label, mask_pos in train_loader:
             optimizer.zero_grad()
-            logits = model(input_ids.to(device), mask.to(device), mask_pos.to(device))
-            loss = criterion(logits, label.to(device))
-            loss.backward()
+            input_ids = input_ids.to(device)
+            attention_mask = mask.to(device)
+            label = label.to(device)
+            mask_pos = mask_pos.to(device)
+
+            with autocast_ctx(device, use_amp):
+                logits = model(input_ids, attention_mask, mask_pos)
+                loss = criterion(logits, label)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             running_loss += loss.item()
 
             # Training-set accuracy comes from the same forward pass, so it costs
             # nothing extra. It is computed with dropout still on, hence slightly
             # pessimistic; use it only to spot underfitting, not to rank runs.
-            running_correct += int((logits.argmax(dim=1) == label.to(device)).sum())
+            running_correct += int((logits.argmax(dim=1) == label).sum())
             seen += label.size(0)
 
         train_loss = running_loss / max(len(train_loader), 1)
         train_acc = running_correct / max(seen, 1)
-        metrics = evaluate(model, val_loader, device, criterion)
+        metrics = evaluate(model, val_loader, device, criterion, use_amp=use_amp)
         val_score = metrics['macro_f1']
 
         history.append({
@@ -291,11 +320,12 @@ def main():
     print(f'\nWrote {len(history_df)} epoch(s) of metrics to {args.history}')
 
     load_model_weights(model, args.out, device=device)
-    print_metrics(evaluate(model, val_loader, device, criterion), 'VALIDATION (best checkpoint)')
-    best = collect(model, val_loader, device, criterion)
+    print_metrics(evaluate(model, val_loader, device, criterion, use_amp=use_amp),
+                  'VALIDATION (best checkpoint)')
+    best = collect(model, val_loader, device, criterion, use_amp=use_amp)
     print('--- CONFUSION MATRIX (best checkpoint) ---')
     print(format_confusion_matrix(best['labels'], best['preds']))
-    evaluate_per_language(model, df_val, tokenizer, args, device)
+    evaluate_per_language(model, df_val, tokenizer, args, device, use_amp=use_amp)
 
 
 if __name__ == '__main__':
