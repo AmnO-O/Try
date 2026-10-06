@@ -35,6 +35,8 @@ from config import (
     PATIENCE,
     READOUT_INIT,
     READOUT_INITS,
+    READOUT_LAYERS,
+    READOUT_HIDDEN,
     SPLIT_SEED,
     UNFREEZE_LAYERS,
     USE_MLM_HEAD,
@@ -68,6 +70,11 @@ def parse_args(argv=None):
     parser.add_argument('--readout-init', choices=READOUT_INITS, default=READOUT_INIT,
                         help="Initialisation of the 2-way readout: 'random' or 'verbalizer' "
                              '(pretrained decoder rows for the label words)')
+    parser.add_argument('--readout-layers', type=int, default=READOUT_LAYERS,
+                        help='Readout depth: 1 = Linear(768, 2); 2 = small MLP '
+                             '(only compatible with --readout-init random)')
+    parser.add_argument('--readout-hidden', type=int, default=READOUT_HIDDEN,
+                        help='Hidden width when --readout-layers 2 (default 384)')
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--out', default=None,
@@ -231,6 +238,8 @@ def main():
         args.model_name,
         unfreeze_layers=args.unfreeze_layers,
         readout_init=args.readout_init,
+        readout_layers=args.readout_layers,
+        readout_hidden=args.readout_hidden,
         use_mlm_head=USE_MLM_HEAD and not args.no_mlm_head,
         tokenizer=tokenizer,
         device=device,

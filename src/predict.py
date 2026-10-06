@@ -17,7 +17,16 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import data as data_mod
-from config import MAX_LEN, MMBERT_MODEL_NAME, READOUT_INIT, READOUT_INITS, USE_MLM_HEAD, best_weights_path
+from config import (
+    MAX_LEN,
+    MMBERT_MODEL_NAME,
+    READOUT_INIT,
+    READOUT_INITS,
+    READOUT_LAYERS,
+    READOUT_HIDDEN,
+    USE_MLM_HEAD,
+    best_weights_path,
+)
 from model import load_model, load_model_weights, load_tokenizer
 from train import collect, format_confusion_matrix, metrics_from, print_metrics, resolve_device
 
@@ -35,6 +44,10 @@ def parse_args(argv=None):
     parser.add_argument('--max-len', type=int, default=MAX_LEN)
     parser.add_argument('--no-mlm-head', action='store_true')
     parser.add_argument('--readout-init', choices=READOUT_INITS, default=READOUT_INIT,
+                        help="Must match the value used at training time")
+    parser.add_argument('--readout-layers', type=int, default=READOUT_LAYERS,
+                        help="Must match the value used at training time")
+    parser.add_argument('--readout-hidden', type=int, default=READOUT_HIDDEN,
                         help="Must match the value used at training time")
     parser.add_argument('--device', default=None)
     parser.add_argument('--eval-only', action='store_true', help='Metrics only, do not write a CSV')
@@ -61,6 +74,8 @@ def main():
         args.model_name,
         unfreeze_layers=0,
         readout_init=args.readout_init,
+        readout_layers=args.readout_layers,
+        readout_hidden=args.readout_hidden,
         use_mlm_head=USE_MLM_HEAD and not args.no_mlm_head,
         tokenizer=tokenizer,
     )

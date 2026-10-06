@@ -95,6 +95,12 @@ UNFREEZE_LAYERS = 2
 BACKBONE_LR = 2e-5
 HEAD_LR = 1e-4
 
+# Readout head depth. 1 = the plain Linear(768, 2); 2 = Linear(768->384) ->
+# GELU -> Dropout -> Linear(384, 2). A deeper head captures more expressiveness
+# but risks overfitting on ~7k rows, so the hidden width stays small.
+READOUT_LAYERS = 1
+READOUT_HIDDEN = 384
+
 # -----------------------------------------------------------------------------
 # TRAINING
 # -----------------------------------------------------------------------------

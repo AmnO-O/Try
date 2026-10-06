@@ -131,28 +131,59 @@ def load_tokenizer(model_name: str):
     return AutoTokenizer.from_pretrained(model_name)
 
 
+class MLPReadout(nn.Module):
+    """Two-layer readout: Linear(hidden) -> GELU -> Dropout -> Linear(2).
+
+    The single Linear is a logistic on top of the pretrained MLM head, which
+    already supplied one nonlinearity. An extra hidden layer can capture more
+    language-specific decision boundaries, but on a ~7k-row corpus the risk is
+    overfitting the head region, so the hidden width is kept small (384) and
+    dropout goes between the layers.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 def build_readout(
     decoder: nn.Linear,
     readout_init: str,
     num_classes: int,
-    label_ids: Optional[Sequence[int]],
-) -> nn.Linear:
-    """Linear readout, optionally initialised from the MLM decoder's label rows.
+    label_ids: Optional[Sequence[int]] = None,
+    readout_layers: int = 1,
+    hidden_dim: int = 768,
+    dropout: float = 0.1,
+) -> nn.Module:
+    """Readout head: a single Linear, or a small MLP.
 
-    With 'verbalizer' the layer starts as an exact copy of the vocab readout
-    restricted to the label rows, so on the first forward pass it produces the
-    same numbers a full MLM would at those two positions.
-
-    Both variants keep a bias, so a checkpoint saved under one initialisation
-    loads cleanly under the other; only the starting point differs.
+    With 'verbalizer' the single Linear starts as an exact copy of the vocab
+    readout restricted to the label rows. That init is only defined for the
+    one-layer case: an MLP's first layer is hidden-width wide, so the two
+    decoder rows cannot be mapped onto it.
     """
     if readout_init not in READOUT_INITS:
         raise ValueError(f'readout_init must be one of {READOUT_INITS}, got {readout_init!r}')
 
-    classifier = nn.Linear(decoder.in_features, num_classes)
-
-    if readout_init == 'random':
-        return classifier
+    if readout_layers == 1:
+        classifier = nn.Linear(decoder.in_features, num_classes)
+        if readout_init == 'random':
+            return classifier
+    elif readout_init == 'verbalizer':
+        raise ValueError(
+            "readout_init='verbalizer' is only defined for a single Linear readout "
+            "(readout_layers=1). Use readout_init='random' with a deeper readout."
+        )
+    else:
+        return MLPReadout(decoder.in_features, hidden_dim, num_classes, dropout)
 
     if label_ids is None:
         raise ValueError("readout_init='verbalizer' needs label token ids")
@@ -172,6 +203,8 @@ def load_model(
     model_name: str,
     unfreeze_layers: int = 2,
     readout_init: str = 'random',
+    readout_layers: int = 1,
+    readout_hidden: int = 384,
     use_mlm_head: bool = True,
     dropout: float = 0.1,
     tokenizer=None,
@@ -186,7 +219,15 @@ def load_model(
     hidden_dim = encoder.config.hidden_size
 
     label_ids = label_token_ids(tokenizer) if readout_init == 'verbalizer' else None
-    classifier = build_readout(mlm.get_output_embeddings(), readout_init, len(LABEL_CLASSES), label_ids)
+    classifier = build_readout(
+        mlm.get_output_embeddings(),
+        readout_init,
+        len(LABEL_CLASSES),
+        label_ids,
+        readout_layers=readout_layers,
+        hidden_dim=readout_hidden,
+        dropout=dropout,
+    )
 
     # Tiny and either pretrained or random, so it always trains.
     for param in classifier.parameters():
@@ -226,7 +267,7 @@ def load_model(
             if param.requires_grad and layer_index_in_name(name) is not None
         })
         state = f'blocks {indices} trainable (of {n_blocks} found)'
-    print(f'  backbone: {state} | readout: {readout_init} | '
+    print(f'  backbone: {state} | readout: {readout_init}/{"L" + str(readout_layers)} | '
           f'trainable {trainable / 1e6:.2f}M / {total / 1e6:.2f}M params')
     return model
 
