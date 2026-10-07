@@ -44,6 +44,25 @@ def encode_stereotype(label: str) -> int:
     return CLASS_TO_ID[value]
 
 
+def encode_label(value: str, column: str = 'stereotype') -> int:
+    """Binary label encoder for either Task A labelling column.
+
+    StereoQueerEval labels the Task-A column 'stereotype'. The auxiliary files
+    (AuxImplicitHate, HateAgainstLGBT, HOLD_*) carry the SAME schema but put
+    the real label in 'hate_speech' as one of none/no/yes_implicit/yes_explicit.
+    Both collapse to binary here, so the readout stays 2-way and the same prompt
+    machinery trains a model on either concept by changing one column name.
+    """
+    v = str(value).strip().lower()
+    if column == 'hate_speech':
+        if v in ('', 'none', 'no'):
+            return 0
+        if v in ('yes', 'yes_implicit', 'yes_explicit'):
+            return 1
+        raise ValueError(f"Unknown hate_speech label: {value!r}")
+    return encode_stereotype(v)
+
+
 def decode_stereotype(class_id: int) -> str:
     """Class index -> 'yes' / 'no'."""
     return LABEL_CLASSES[int(class_id)]
@@ -141,15 +160,18 @@ def _read_tsv(path: str) -> pd.DataFrame:
     return df[REQUIRED_COLUMNS].copy()
 
 
-def _add_features(df: pd.DataFrame, lang: str, max_len: int = MAX_LEN) -> pd.DataFrame:
+def _add_features(df: pd.DataFrame, lang: str, max_len: int = MAX_LEN,
+                  label_column: str = 'stereotype') -> pd.DataFrame:
     budget = PromptBudget(max_len=max_len)
+    if label_column not in REQUIRED_COLUMNS:
+        raise ValueError(f'label_column must be one of {REQUIRED_COLUMNS}, got {label_column!r}')
     df['lang'] = lang
     df['context'] = [
         build_context(c, t, d)
         for c, t, d in zip(df['yt_comment'], df['yt_title'], df['yt_description'])
     ]
     df['prompt'] = [render_prompt(row, lang, budget) for _, row in df.iterrows()]
-    df['st_y'] = [encode_stereotype(s) for s in df['stereotype']]
+    df['st_y'] = [encode_label(s, label_column) for s in df[label_column]]
     return df
 
 
@@ -167,6 +189,7 @@ def load_frame(
     data_dir: str = DATA_DIR,
     languages: Optional[List[str]] = None,
     max_len: int = MAX_LEN,
+    label_column: str = 'stereotype',
 ) -> pd.DataFrame:
     """Reads every language TSV into one frame with prompts and encoded labels."""
     frames = []
@@ -177,17 +200,19 @@ def load_frame(
         lang = match.group(1)
         if languages and lang not in languages:
             continue
-        frames.append(_add_features(_read_tsv(path), lang, max_len))
+        frames.append(_add_features(_read_tsv(path), lang, max_len, label_column=label_column))
 
     if not frames:
         raise ValueError('No language files matched the requested languages.')
     return pd.concat(frames, ignore_index=True)
 
 
-def load_frame_from_file(path: str, max_len: int = MAX_LEN) -> pd.DataFrame:
+def load_frame_from_file(path: str, max_len: int = MAX_LEN,
+                         label_column: str = 'stereotype') -> pd.DataFrame:
     """Same encoding as load_frame but for a single explicit TSV path."""
     match = re.search(r'_([A-Z]{2})(?:_training|_clean)?\.tsv$', os.path.basename(path))
-    return _add_features(_read_tsv(path), match.group(1) if match else 'EN', max_len)
+    return _add_features(_read_tsv(path), match.group(1) if match else 'EN', max_len,
+                         label_column=label_column)
 
 
 def split_by_video(

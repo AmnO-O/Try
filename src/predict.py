@@ -39,6 +39,8 @@ def parse_args(argv=None):
                         help='Checkpoint (default: weights/best_mmbert_stereotype_prompt_<readout>.pt)')
     parser.add_argument('--model-name', default=MMBERT_MODEL_NAME)
     parser.add_argument('--input', default=None, help='TSV to score; defaults to all training languages')
+    parser.add_argument('--label-column', default='stereotype',
+                        help="Label column used for metrics: 'stereotype' or 'hate_speech'")
     parser.add_argument('--out', default='predictions.csv')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--max-len', type=int, default=MAX_LEN)
@@ -63,9 +65,10 @@ def main():
     device = resolve_device(args.device)
 
     if args.input:
-        df = data_mod.load_frame_from_file(args.input, max_len=args.max_len)
+        df = data_mod.load_frame_from_file(args.input, max_len=args.max_len,
+                                           label_column=args.label_column)
     else:
-        df = data_mod.load_frame(max_len=args.max_len)
+        df = data_mod.load_frame(max_len=args.max_len, label_column=args.label_column)
 
     tokenizer = load_tokenizer(args.model_name)
     loader = data_mod.build_inference_loader(df, tokenizer, args.batch_size, args.max_len)

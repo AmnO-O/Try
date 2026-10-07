@@ -82,6 +82,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--model-name', default=MMBERT_MODEL_NAME)
     parser.add_argument('--languages', nargs='*', default=None, help='Subset of EN/IT/NL (default: all)')
+    parser.add_argument('--input', default=None,
+                        help='Single TSV to train on instead of the --languages glob '
+                             '(e.g. AuxImplicitHate_EN_training.tsv for stage-1 transfer)')
+    parser.add_argument('--label-column', default='stereotype',
+                        help="Label column: 'stereotype' (Task A) or 'hate_speech' "
+                             '(auxiliary files; yes_implicit/yes_explicit both map to 1)')
     parser.add_argument('--max-len', type=int, default=MAX_LEN)
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
     parser.add_argument('--epochs', type=int, default=MAX_EPOCHS)
@@ -116,6 +122,9 @@ def parse_args(argv=None):
     parser.add_argument('--no-amp', action='store_true',
                         help='Disable mixed precision (default: fp16 autocast on CUDA)')
     parser.add_argument('--evaluate-only', action='store_true', help='Load --out and report val metrics only')
+    parser.add_argument('--from-checkpoint', default=None,
+                        help='Continue from a saved state dict instead of the pretrained checkpoint '
+                             '(same architecture/readout required); enables stage-2 fine-tunes')
 
     args = parser.parse_args(argv)
     # Resolved here rather than as argparse defaults because both depend on
@@ -257,6 +266,12 @@ def main():
     print(f'Device: {device} | mixed precision: {"ON (fp16)" if use_amp else "off"}')
 
     df_all = data_mod.load_frame(languages=args.languages, max_len=args.max_len)
+    if args.input:
+        df_all = data_mod.load_frame_from_file(args.input, max_len=args.max_len,
+                                               label_column=args.label_column)
+    else:
+        df_all = data_mod.load_frame(languages=args.languages, max_len=args.max_len,
+                                     label_column=args.label_column)
     df_train, df_val = data_mod.split_by_video(df_all, args.val_fraction, args.split_seed)
     print(f"Train: {len(df_train)} | Val: {len(df_val)} | labels: {data_mod.label_distribution(df_train)}")
 
@@ -284,6 +299,9 @@ def main():
         tokenizer=tokenizer,
         device=device,
     )
+    if args.from_checkpoint:
+        load_model_weights(model, args.from_checkpoint, device=device)
+        print(f'  resumed from checkpoint: {args.from_checkpoint}')
 
     if args.evaluate_only:
         load_model_weights(model, args.out, device=device)
