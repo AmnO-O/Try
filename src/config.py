@@ -65,6 +65,11 @@ PROMPT_TEMPLATES = {
         'video: {video}\nreactie: {context}\nvraag: geeft deze reactie een stereotype weer over queer mensen? antwoord: {mask}',
         'geeft deze reactie een stereotype weer over queer mensen?',
     ),
+    'FA': (
+        'video: {video}\ncomment: {context}\nquestion: '
+        'آیا این کامنت دربارهی افراد کویر کلیشهسازی میکند؟ answer: {mask}',
+        'آیا این کامنت دربارهی افراد کویر کلیشهسازی میکند؟',
+    ),
 }
 DEFAULT_PROMPT = PROMPT_TEMPLATES['EN']
 

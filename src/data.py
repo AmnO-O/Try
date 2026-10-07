@@ -210,7 +210,7 @@ def load_frame(
 def load_frame_from_file(path: str, max_len: int = MAX_LEN,
                          label_column: str = 'stereotype') -> pd.DataFrame:
     """Same encoding as load_frame but for a single explicit TSV path."""
-    match = re.search(r'_([A-Z]{2})(?:_training|_clean)?\.tsv$', os.path.basename(path))
+    match = re.search(r'_([A-Z]{2})(?:_training|_clean|_development)?\.tsv$', os.path.basename(path))
     return _add_features(_read_tsv(path), match.group(1) if match else 'EN', max_len,
                          label_column=label_column)
 
