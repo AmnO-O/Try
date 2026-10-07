@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""mmBERT as a mask-targeted classifier for Task A (stereotype detection).
+"""Mask-targeted classifier on top of any AutoModelForMaskedLM.
 
 Architecture:
 
-    encoder (ModernBertModel)  ->  [MASK] position  ->  pretrained mlm_head  ->  Linear(768, 2)
+    encoder  ->  [MASK] position  ->  pretrained prediction head  ->  Linear(hidden, 2)
 
-The full `ModernBertForMaskedLM` ships a `decoder` of shape (vocab=256000, 768),
-about 197M parameters that classification never needs, so only the rows used by
-the readout are kept.
+Works across architectures with different internals (ModernBERT keeps the
+transformer under `.model`; RoBERTa/XLMRoBERTa under `.roberta` and pack the
+vocab decoder inside `.lm_head`; BERT uses `.bert` / `.cls.predictions`).
+_extract_parts() normalises all of them to encoder + decoder-free head + decoder.
+
+The shadow MLM decoder (vocab x hidden, 197-256M params) is never needed for
+classification, so only the label-word rows seed the readout before it is freed.
 
 Two readout initialisations are supported:
 
@@ -19,8 +23,8 @@ Two readout initialisations are supported:
                  EN, IT and NL at once. An English verbalizer is a poor fit for
                  Dutch comments.
 
-Both are a single Linear layer; only its initialisation differs, so the flag
-costs nothing and the choice is settled by validation macro-F1.
+Both produce the same readout interface; only the initialisation differs, so the
+flag costs nothing and the choice is settled by validation macro-F1.
 """
 
 import os
@@ -29,6 +33,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 from config import LABEL_CLASSES
@@ -131,6 +136,65 @@ def load_tokenizer(model_name: str):
     return AutoTokenizer.from_pretrained(model_name)
 
 
+_ACTIVATIONS = {'gelu': F.gelu, 'gelu_new': F.gelu}
+
+
+class _ProjectionHead(nn.Module):
+    """The pretrained prediction head with its vocab decoder removed.
+
+    ModernBERT ships a decoder-free head already (mlm.head). BERT/RoBERTa/
+    XLMRoBERTa keep the decoder *inside* lm_head / cls.predictions, so here we
+    rebuild just dense -> act -> layer_norm (RoBERTa also adds a residual) and
+    discard the linear-to-vocab projection.
+    """
+
+    def __init__(self, lm_head: nn.Module, hidden_act: str = 'gelu', residual: bool = False):
+        super().__init__()
+        self.dense = lm_head.dense
+        self.act = _ACTIVATIONS.get(hidden_act, F.gelu)
+        self.layer_norm = lm_head.layer_norm
+        self.residual = residual
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.act(self.dense(x))
+        if self.residual:
+            h = x + h
+        return self.layer_norm(h)
+
+
+def _extract_parts(mlm, model_name: str):
+    """(encoder, head, decoder) from any AutoModelForMaskedLM, agnostically.
+
+    Different Classes hold the transformer under different attributes
+    (ModernBERT: 'model'; RoBERTa/XLMRoBERTa: 'roberta'; BERT: 'bert'), and the
+    pretrained prediction head may or may not embed its own linear-to-vocab
+    decoder. Both differences are normalised here so load_model only ever deals
+    with: an encoder without the head, a size-preserving head, and a (hidden,
+    vocab) decoder for the readout init.
+    """
+    encoder = (getattr(mlm, 'model', None)
+               or getattr(mlm, 'roberta', None)
+               or getattr(mlm, 'bert', None))
+    if encoder is None:
+        raise ValueError(f'{model_name}: no encoder submodule found '
+                         "(expected 'model', 'roberta' or 'bert').")
+
+    decoder = mlm.get_output_embeddings()
+    if decoder is None:
+        raise ValueError(f'{model_name}: get_output_embeddings() returned None.')
+
+    hidden_act = getattr(mlm.config, 'hidden_act', 'gelu')
+    if hasattr(mlm, 'head'):
+        head = mlm.head                      # ModernBERT: already decoder-free
+    elif hasattr(mlm, 'lm_head'):
+        head = _ProjectionHead(mlm.lm_head, hidden_act, residual=True)   # RoBERTa / XLMRoBERTa
+    elif hasattr(mlm, 'cls') and hasattr(mlm.cls, 'predictions'):
+        head = _ProjectionHead(mlm.cls.predictions, hidden_act, residual=False)  # BERT
+    else:
+        raise ValueError(f'{model_name}: no recognisable prediction head.')
+    return encoder, head, decoder
+
+
 class MLPReadout(nn.Module):
     """Two-layer readout: Linear(hidden) -> GELU -> Dropout -> Linear(2).
 
@@ -215,12 +279,12 @@ def load_model(
         tokenizer = load_tokenizer(model_name)
 
     mlm = AutoModelForMaskedLM.from_pretrained(model_name)
-    encoder = mlm.model
-    hidden_dim = encoder.config.hidden_size
+    encoder, pretrained_head, decoder = _extract_parts(mlm, model_name)
+    hidden_dim = decoder.in_features
 
     label_ids = label_token_ids(tokenizer) if readout_init == 'verbalizer' else None
     classifier = build_readout(
-        mlm.get_output_embeddings(),
+        decoder,
         readout_init,
         len(LABEL_CLASSES),
         label_ids,
@@ -233,7 +297,7 @@ def load_model(
     for param in classifier.parameters():
         param.requires_grad = True
 
-    mlm_head = mlm.head if use_mlm_head else nn.Identity()
+    mlm_head = pretrained_head if use_mlm_head else nn.Identity()
     if use_mlm_head:
         for param in mlm_head.parameters():
             param.requires_grad = True
