@@ -66,9 +66,9 @@ PROMPT_TEMPLATES = {
         'geeft deze reactie een stereotype weer over queer mensen?',
     ),
     'FA': (
-        'video: {video}\ncomment: {context}\nquestion: '
-        'آیا این کامنت دربارهی افراد کویر کلیشهسازی میکند؟ answer: {mask}',
-        'آیا این کامنت دربارهی افراد کویر کلیشهسازی میکند؟',
+        'ویدیو: {video}\nکامنت: {context}\nپرسش: '
+        'آیا این کامنت درباره‌ی افراد کوئیر کلیشه‌سازی می‌کند؟ پاسخ: {mask}',
+        'آیا این کامنت درباره‌ی افراد کوئیر کلیشه‌سازی می‌کند؟',
     ),
 }
 DEFAULT_PROMPT = PROMPT_TEMPLATES['EN']
