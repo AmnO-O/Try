@@ -122,6 +122,10 @@ def parse_args(argv=None):
     parser.add_argument('--no-amp', action='store_true',
                         help='Disable mixed precision (default: fp16 autocast on CUDA)')
     parser.add_argument('--evaluate-only', action='store_true', help='Load --out and report val metrics only')
+    parser.add_argument('--train-extras', default=None,
+                        help="Comma-separated schema-compatible TSVs appended to the TRAIN split only, "
+                             "after the video-level split (val stays identical to baseline); each file's "
+                             "language is inferred from its filename, labels read from --label-column")
     parser.add_argument('--from-checkpoint', default=None,
                         help='Continue from a saved state dict instead of the pretrained checkpoint '
                              '(same architecture/readout required); enables stage-2 fine-tunes')
@@ -273,6 +277,16 @@ def main():
         df_all = data_mod.load_frame(languages=args.languages, max_len=args.max_len,
                                      label_column=args.label_column)
     df_train, df_val = data_mod.split_by_video(df_all, args.val_fraction, args.split_seed)
+    if args.train_extras:
+        extra_frames = [
+            data_mod.load_frame_from_file(path.strip(), max_len=args.max_len,
+                                          label_column=args.label_column)
+            for path in args.train_extras.split(',') if path.strip()
+        ]
+        df_train = pd.concat([df_train] + extra_frames, ignore_index=True)
+        print(f"Train extras: +{sum(len(f) for f in extra_frames)} rows "
+              f"(total train {len(df_train)}) | extra langs: "
+              f"{sorted({l for f in extra_frames for l in f['lang'].unique()})}")
     print(f"Train: {len(df_train)} | Val: {len(df_val)} | labels: {data_mod.label_distribution(df_train)}")
 
     tokenizer = load_tokenizer(args.model_name)
