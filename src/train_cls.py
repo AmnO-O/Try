@@ -62,9 +62,6 @@ def parse_args(argv=None):
     parser.add_argument('--lr', type=float, default=BACKBONE_LR, help='Learning rate (all trainable params)')
     parser.add_argument('--weight-decay', type=float, default=WEIGHT_DECAY)
     parser.add_argument('--unfreeze-layers', type=int, default=UNFREEZE_LAYERS, help='0 freezes all of mmBERT')
-    parser.add_argument('--readout-init', choices=('random', 'verbalizer'), default='random',
-                        help="Classifier head init: 'random', or 'verbalizer' = seed the two rows "
-                             "from the pretrained embeddings of the label words ' no'/' yes'")
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--out', default=None, help='Checkpoint path (state dict)')
@@ -229,9 +226,9 @@ def main():
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'Device: {device}')
 
-    from transformers import (AutoModelForMaskedLM, AutoModelForSequenceClassification,
-                             AutoTokenizer, Trainer, TrainingArguments)
-    from model import unfreeze_last_n, label_token_ids
+    from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
+                             Trainer, TrainingArguments)
+    from model import unfreeze_last_n
     use_amp = not args.no_amp and device.type == 'cuda'
     print(f'mixed precision: {"ON (fp16)" if use_amp else "off (fp32)"}')
     try:
@@ -248,18 +245,6 @@ def main():
     if args.from_checkpoint:
         model.load_state_dict(torch.load(args.from_checkpoint, map_location='cpu'))
         print(f'  resumed from checkpoint: {args.from_checkpoint}')
-
-    if args.readout_init == 'verbalizer':
-        ids = label_token_ids(tokenizer)
-        mlm = AutoModelForMaskedLM.from_pretrained(args.model_name)
-        dec = mlm.get_output_embeddings()
-        with torch.no_grad():
-            model.classifier.weight.copy_(dec.weight[ids].detach())
-            if dec.bias is not None:
-                model.classifier.bias.copy_(dec.bias[ids].detach())
-        del mlm
-        print(f'  readout: verbalizer (label word ids {ids}) seeded weight+bias rows '
-              'from the pretrained MLM decoder')
 
     n_blocks = unfreeze_last_n(model.base_model, args.unfreeze_layers)
     for param in model.classifier.parameters():
