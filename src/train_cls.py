@@ -72,6 +72,9 @@ def parse_args(argv=None):
                         help='CSV for per-epoch metrics (default: <out>_history.csv)')
     parser.add_argument('--seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--device', default=None, help='cuda | cpu (default: auto)')
+    parser.add_argument('--no-amp', action='store_true',
+                        help='Disable mixed precision (fp32). Fixes nan eval_loss from fp16 '
+                             "logit overflow, at ~2-4x slower epochs")
     parser.add_argument('--train-extras', default=None,
                         help="Comma-separated schema-compatible TSVs appended to the TRAIN split only, "
                              'after the video-level split (val stays identical to baseline)')
@@ -229,6 +232,8 @@ def main():
     from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
                              Trainer, TrainingArguments)
     from model import unfreeze_last_n, label_token_ids
+    use_amp = not args.no_amp and device.type == 'cuda'
+    print(f'mixed precision: {"ON (fp16)" if use_amp else "off (fp32)"}')
     try:
         from transformers.integrations import EarlyStoppingCallback
         can_early_stop = True
@@ -280,7 +285,8 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
         weight_decay=args.weight_decay,
-        fp16=(device.type == 'cuda'),
+        fp16=use_amp,
+        fp16_full_eval=False,
         save_strategy='epoch',
         load_best_model_at_end=True,
         metric_for_best_model='macro_f1',
