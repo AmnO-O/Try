@@ -118,8 +118,10 @@ def parse_args(argv=None):
                              '(0 or -1 disables early stopping)')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE,
                         help='Classifier-phase batch size (torch head only)')
-    parser.add_argument('--contrastive-batch-size', type=int, default=16,
-                        help='Embedding-phase batch size (contrastive pairs)')
+    parser.add_argument('--contrastive-batch-size', type=int, default=8,
+                        help='Embedding-phase batch size in contrastive PAIRS (each pair = 2 x '
+                             'max-seq-length sequences). Default 8 keeps a 307M backbone inside a '
+                             '16 GB T4; raise it only if you have headroom, lower it on OOM.')
     parser.add_argument('--learning-rate', type=float, default=2e-5,
                         help='Body learning rate (embedding contrastive phase)')
     parser.add_argument('--head-learning-rate', type=float, default=1e-2,
@@ -362,9 +364,9 @@ def train_classifier_phase(args, model, train_texts, train_labels,
     model.freeze('body')
 
     with torch.no_grad():
-        train_emb = model.encode(list(train_texts), batch_size=args.batch_size,
+        train_emb = model.encode(list(train_texts), batch_size=args.contrastive_batch_size,
                                  show_progress_bar=False)
-        val_emb = model.encode(list(val_texts), batch_size=args.batch_size,
+        val_emb = model.encode(list(val_texts), batch_size=args.contrastive_batch_size,
                                show_progress_bar=False)
 
     dataset = torch.utils.data.TensorDataset(train_emb, torch.as_tensor(train_labels))
@@ -620,6 +622,10 @@ def main():
         return
 
     device = args.device if args.device else resolve_device(None)
+    if device == 'cuda':
+        # Reduces allocator fragmentation on the 307M backbone; must be set before
+        # CUDA context init, hence before load_deps() imports torch.
+        os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
     if device == 'cuda' and not _torch_available():
         raise SystemExit('CUDA was selected but torch.cuda.is_available() is False; '
                          're-run with --device cpu.')
