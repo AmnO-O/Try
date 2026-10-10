@@ -262,7 +262,6 @@ def main():
                         max_len=args.max_len)
     pad_id = tokenizer.pad_token_id
     train_collate = lambda batch: collate(batch, pad_id)
-    val_collate = lambda batch: collate(batch, pad_id)
 
     kwargs = dict(
         output_dir=os.path.join(os.path.dirname(args.out), 'cls_runs'),
@@ -293,7 +292,6 @@ def main():
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=train_collate,
-        eval_data_collator=val_collate,
         compute_metrics=compute_metrics,
     )
     if can_early_stop and args.patience:
