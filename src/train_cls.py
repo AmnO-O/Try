@@ -229,8 +229,8 @@ def main():
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'Device: {device}')
 
-    from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
-                             Trainer, TrainingArguments)
+    from transformers import (AutoModelForMaskedLM, AutoModelForSequenceClassification,
+                             AutoTokenizer, Trainer, TrainingArguments)
     from model import unfreeze_last_n, label_token_ids
     use_amp = not args.no_amp and device.type == 'cuda'
     print(f'mixed precision: {"ON (fp16)" if use_amp else "off (fp32)"}')
@@ -251,10 +251,15 @@ def main():
 
     if args.readout_init == 'verbalizer':
         ids = label_token_ids(tokenizer)
-        emb = model.get_input_embeddings().weight
+        mlm = AutoModelForMaskedLM.from_pretrained(args.model_name)
+        dec = mlm.get_output_embeddings()
         with torch.no_grad():
-            model.classifier.weight.copy_(emb[ids].detach())
-        print(f'  readout: verbalizer (label word ids {ids}) seeded from pretrained embeddings')
+            model.classifier.weight.copy_(dec.weight[ids].detach())
+            if dec.bias is not None:
+                model.classifier.bias.copy_(dec.bias[ids].detach())
+        del mlm
+        print(f'  readout: verbalizer (label word ids {ids}) seeded weight+bias rows '
+              'from the pretrained MLM decoder')
 
     n_blocks = unfreeze_last_n(model.base_model, args.unfreeze_layers)
     for param in model.classifier.parameters():
