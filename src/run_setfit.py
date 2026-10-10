@@ -25,9 +25,17 @@ The modern SetFit v2 API is used:
 
 `--label-column` is honoured by `data.load_frame`: it encodes the chosen column
 into the binary `st_y` (stereotype yes/no, or hate_speech none/no/yes_implicit/
-yes_explicit -> 0/1). The head width tracks the number of classes in `st_y`,
-and the evaluator is multi-class, so the same script can score a 3-class label
-if such an encoder is added.
+yes_explicit -> 0/1) using the OFFICIAL mapping in `config.CLASS_TO_ID` /
+`data.encode_label`. The readout class list is therefore FIXED at [0, 1] for
+Task A (never inferred from whichever labels a split happens to hold), and the
+labels are validated BEFORE the model is built:
+  * train split must have >= 2 classes, contiguous from 0;
+  * validation classes must be a subset of training classes;
+  * train AND validation must each contain every expected class (hard error in
+    full runs, warning in --smoke).
+Macro-F1 and per-class F1 always average over this same fixed class list, for
+every language and every split, so runs stay comparable even when a split or a
+language has no sample of a class.
 
 Outputs:
   * `<out>/`            - SetFit model via save_pretrained
@@ -62,6 +70,7 @@ import time
 
 from config import (
     BATCH_SIZE,
+    CLASS_TO_ID,
     MAX_EPOCHS,
     MAX_LEN,
     SPLIT_SEED,
@@ -447,6 +456,70 @@ def _dump_json(path: str, data: dict) -> None:
         json.dump(data, fh, ensure_ascii=False, indent=2, default=str)
 
 
+def expected_classes(label_column: str):
+    """FIXED readout class ids from the OFFICIAL mapping (config/data.py), never
+    inferred from the observed labels of a split.
+
+    `stereotype` -> sorted(config.CLASS_TO_ID.values()) == [0, 1]
+    ('no'=0, 'yes'=1). `hate_speech` collapses none/no -> 0 and
+    yes/yes_implicit/yes_explicit -> 1 (data.encode_label), also [0, 1].
+    """
+    if label_column == 'stereotype':
+        codes = sorted(set(int(c) for c in CLASS_TO_ID.values()))
+    else:
+        try:
+            import data as _data
+            codes = sorted(set(int(_data.encode_label(v, label_column))
+                               for v in ('none', 'no', 'yes', 'yes_implicit',
+                                         'yes_explicit')))
+        except Exception:
+            codes = [0, 1]
+    return codes
+
+
+def validate_labels(train_labels, val_labels, expected, smoke: bool) -> bool:
+    """Label control BEFORE the classifier is built.
+
+    Enforces (per the review contract):
+      * training split has >= 2 classes;
+      * training labels are contiguous from 0;
+      * validation classes are a subset of training classes;
+      * train AND validation each contain the full EXPECTED class set -- for the
+        main experiment this is a hard error (a language/class missed by the
+        split is unreportable), for --smoke a warning.
+    """
+    import numpy as np
+
+    train_classes = np.sort(np.unique(np.asarray(train_labels)))
+    val_classes = np.sort(np.unique(np.asarray(val_labels)))
+
+    if len(train_classes) < 2:
+        raise ValueError(
+            f'Training split has fewer than 2 classes: {train_classes.tolist()}')
+    expected_train = np.arange(len(train_classes))
+    if not np.array_equal(train_classes, expected_train):
+        raise ValueError(
+            f'Labels must be contiguous from 0: got {train_classes.tolist()}')
+    if not np.isin(val_classes, train_classes).all():
+        raise ValueError(
+            f'Validation contains classes missing from training: '
+            f'{val_classes.tolist()}')
+    missing_train = [c for c in expected if c not in train_classes.tolist()]
+    missing_val = [c for c in expected if c not in val_classes.tolist()]
+    if missing_train or missing_val:
+        msg = (f'Expected classes {expected} not fully present: train missing '
+               f'{missing_train}, val missing {missing_val}. Macro-F1 is still '
+               'computed over the fixed class list, but the missing class/lang '
+               'cannot be judged.')
+        if smoke:
+            print(f'WARNING: {msg}')
+        else:
+            raise ValueError(msg)
+    print(f'Label control OK: train {train_classes.tolist()} | '
+          f'val {val_classes.tolist()} | fixed macro-F1 class list: {expected}')
+    return True
+
+
 def check_setfit_api(model):
     """Fail loudly if the installed setfit/sentence-transformers no longer expose
     the internals this script relies on, so results can't silently become
@@ -557,27 +630,17 @@ def main():
         df_all = df_all.sample(n=min(args.smoke, len(df_all)),
                                random_state=args.seed).reset_index(drop=True)
     df_train, df_val = data_mod.split_by_video(df_all, args.val_fraction, args.split_seed)
-    train_classes = set(int(c) for c in df_train['st_y'].unique())
-    val_classes = set(int(c) for c in df_val['st_y'].unique())
-    if train_classes != val_classes:
-        msg = (f'Class sets differ across splits: train {sorted(train_classes)} vs '
-               f'val {sorted(val_classes)}; macro-F1 would average over different class sets.')
-        if args.smoke:
-            print(f'WARNING: {msg}')
-        else:
-            raise RuntimeError(msg)
-    classes = sorted(train_classes | val_classes)
+    train_labels = df_train['st_y'].values
+    val_labels = df_val['st_y'].values
+    classes = expected_classes(args.label_column)
+    label_sets_ok = validate_labels(train_labels, val_labels, classes, args.smoke)
     n_classes = len(classes)
     dist = {str(k): int(v) for k, v in df_train['st_y'].value_counts().items()}
-    print(f'Label sets after split: train {sorted(train_classes)} | val {sorted(val_classes)} | '
-          f'fixed class list for macro-F1: {classes}')
-    print(f'Train: {len(df_train)} | Val: {len(df_val)} | st_y classes: {n_classes} | '
-          f'train label counts: {dist}')
+    print(f'Train: {len(df_train)} | Val: {len(df_val)} | readout classes: {n_classes} '
+          f'({classes}) | train label counts: {dist}')
 
     train_texts = build_texts(df_train, data_mod, args.max_len)
     val_texts = build_texts(df_val, data_mod, args.max_len)
-    val_labels = df_val['st_y'].values
-    train_labels = df_train['st_y'].values
 
     st, used_backbone = build_sentence_model(args)
     token_audit = audit_token_lengths(val_texts, df_val['lang'].values, st, args.max_seq_length)
@@ -639,7 +702,7 @@ def main():
         'device': device,
         'amp': bool(amp),
         'classes': classes,
-        'label_sets_match': bool(train_classes == val_classes),
+        'label_sets_match': bool(label_sets_ok),
         'api_check': api_check,
         'n_classes': n_classes,
         'train_size': int(len(df_train)),
