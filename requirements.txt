@@ -1,6 +1,15 @@
 numpy
 pandas
+# torch is NOT pinned on purpose: Kaggle ships its own CUDA build.
+# For local CPU runs install: pip install torch --index-url https://download.pytorch.org/whl/cpu
 torch
-transformers
-scikit-learn
-setfit
+# SetFit stack -- PINNED: run_setfit.py relies on SetFit/ST internals
+# (_prepare_dataloader, _prepare_optimizer, model_head.get_loss_fn, ...).
+# Do not bump these before re-running the SetFit API self-check + smoke test;
+# an unchecked bump makes results non-reproducible.
+setfit==1.2.0
+sentence-transformers==6.1.0
+transformers==5.19.0
+datasets==5.1.0
+evaluate==0.4.6
+scikit-learn==1.9.0

@@ -266,18 +266,24 @@ def make_trainer(args, model, training_args):
 def predict_labels(model, texts):
     import numpy as np
 
-    preds = model.predict(list(texts), use_labels=False)
-    if hasattr(preds, 'tolist'):
-        preds = preds.tolist()
+    preds = model.predict(list(texts), use_labels=False,
+                          as_numpy=True, show_progress_bar=False)
     return np.asarray(preds, dtype=int)
 
 
-def evaluate(model, texts, labels):
-    """Multi-class evaluation. Handles (n,), (n,1) and (n,k>=2) proba shapes."""
+def evaluate(model, texts, labels, classes=None):
+    """Multi-class evaluation over a FIXED class list. Handles (n,), (n,1)
+    and (n,k>=2) proba shapes; macro-averaging always uses `classes` so runs
+    are comparable even if one split is missing a class."""
     import numpy as np
     from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-    proba = np.asarray(model.predict_proba(list(texts)), dtype=float)
+    if classes is None:
+        classes = sorted(set(int(c) for c in labels))
+    labels = np.asarray(labels)
+    proba = np.asarray(model.predict_proba(list(texts), as_numpy=True,
+                                          show_progress_bar=False),
+                       dtype=np.float64)
     if proba.ndim == 1:
         proba = np.column_stack([1 - proba, proba])
     elif proba.ndim == 2 and proba.shape[1] == 1:
@@ -291,33 +297,42 @@ def evaluate(model, texts, labels):
 
     metrics = {
         'acc': accuracy_score(labels, preds),
-        'macro_f1': f1_score(labels, preds, average='macro', zero_division=0),
-        'precision_macro': precision_score(labels, preds, average='macro', zero_division=0),
-        'recall_macro': recall_score(labels, preds, average='macro', zero_division=0),
+        'macro_f1': f1_score(labels, preds, labels=classes, average='macro', zero_division=0),
+        'precision_macro': precision_score(labels, preds, labels=classes, average='macro',
+                                           zero_division=0),
+        'recall_macro': recall_score(labels, preds, labels=classes, average='macro',
+                                     zero_division=0),
         'preds': preds,
         'labels': labels,
     }
-    if proba.shape[1] == 2:
+    if len(classes) == 2:
         metrics['f1_yes'] = float(
-            f1_score(labels, preds, labels=[1], average=None, zero_division=0)[0])
-    for cls in sorted(set(int(c) for c in labels)):
+            f1_score(labels, preds, labels=[classes[1]], average=None, zero_division=0)[0])
+    for cls in classes:
         metrics[f'f1_class{cls}'] = float(
             f1_score(labels, preds, labels=[cls], average=None, zero_division=0)[0])
     return metrics
 
 
 def train_classifier_phase(args, model, train_texts, train_labels,
-                           val_texts, val_labels, device):
+                           val_texts, val_labels, classes, device):
     """Trains only the classifier head on frozen body embeddings.
 
-    torch head: per-epoch loop logging validation macro-F1/acc, with
-    `--patience` early stopping and best-epoch head restore. Returns the real
-    per-epoch history and the best epoch.
+    The frozen body is kept in eval() mode throughout (dropout of the backbone
+    is OFF), so the embeddings feeding the head are deterministic -- this is
+    what makes the head-only baseline a true "fixed embeddings" control.
+
+    torch head: per-epoch loop logging validation macro-F1/acc (macro-averaged
+    over the fixed `classes` list), with `--patience` early stopping and
+    best-epoch head restore. Returns the real per-epoch history and the best
+    epoch.
     lr head: single sklearn fit; returns an empty history (one metrics row is
     appended by the caller).
     """
     import torch
     from sklearn.metrics import accuracy_score, f1_score
+
+    model.model_body.eval()  # deterministic frozen embeddings for both heads
 
     if args.head == 'lr':
         print(f'Training {args.head} head: single LogisticRegression fit '
@@ -328,7 +343,7 @@ def train_classifier_phase(args, model, train_texts, train_labels,
 
     print(f'Training torch head: up to {args.head_epochs} epoch(s), '
           f'patience {args.patience}, batch {args.batch_size}, '
-          f'lr {args.head_learning_rate}.')
+          f'lr {args.head_learning_rate} (frozen body in eval() mode).')
     model.freeze('body')
     dataloader = model._prepare_dataloader(
         list(train_texts), list(train_labels), args.batch_size, args.max_seq_length)
@@ -338,7 +353,6 @@ def train_classifier_phase(args, model, train_texts, train_labels,
 
     history, best_macro, best_state, best_epoch, wait = [], -1.0, None, 0, 0
     for epoch in range(1, args.head_epochs + 1):
-        model.model_body.train()
         model.model_head.train()
         total_loss, n_batches = 0.0, 0
         for features, labels in dataloader:
@@ -357,10 +371,10 @@ def train_classifier_phase(args, model, train_texts, train_labels,
             n_batches += 1
         scheduler.step()
 
-        model.model_body.eval()
         model.model_head.eval()
         preds = predict_labels(model, val_texts)
-        macro = float(f1_score(val_labels, preds, average='macro', zero_division=0))
+        macro = float(f1_score(val_labels, preds, labels=classes,
+                               average='macro', zero_division=0))
         acc = float(accuracy_score(val_labels, preds))
         row = {
             'epoch': epoch,
@@ -433,6 +447,37 @@ def _dump_json(path: str, data: dict) -> None:
         json.dump(data, fh, ensure_ascii=False, indent=2, default=str)
 
 
+def check_setfit_api(model):
+    """Fail loudly if the installed setfit/sentence-transformers no longer expose
+    the internals this script relies on, so results can't silently become
+    non-reproducible after a library bump. Runs before any training."""
+    import inspect
+    from setfit import SetFitModel
+
+    api = {}
+    for name in ['model_body', 'model_head', 'freeze', 'normalize_embeddings'] + \
+                ['_prepare_dataloader', '_prepare_optimizer']:
+        api[name] = hasattr(model, name)
+        if not api[name]:
+            raise RuntimeError(
+                f'setfit missing {name} -- private API drifted in setfit/'
+                'sentence-transformers. Align run_setfit.py with the pinned '
+                'versions (see requirements.txt) BEFORE treating any result as '
+                'reproducible.')
+    api['predict_proba_as_numpy'] = 'as_numpy' in inspect.signature(
+        SetFitModel.predict_proba).parameters
+    if not api['predict_proba_as_numpy']:
+        raise RuntimeError(
+            'SetFitModel.predict_proba lacks as_numpy=...; results would break on '
+            'CUDA. Align versions before running.')
+    api['head_get_loss_fn'] = hasattr(model.model_head, 'get_loss_fn')
+    if api['head_get_loss_fn']:
+        api['body_eval_during_head'] = True
+    print('SetFit API self-check: all required internals present '
+          f"({', '.join(sorted(k for k, v in api.items() if v))}).")
+    return api
+
+
 def write_run_metadata(args, meta_extra: dict, path: str) -> None:
     import sklearn
     import sentence_transformers
@@ -467,8 +512,6 @@ def write_run_metadata(args, meta_extra: dict, path: str) -> None:
         'head_learning_rate': args.head_learning_rate,
         'lr_c': args.lr_c,
         'lr_max_iter': args.lr_max_iter,
-        'device': args.device or 'auto',
-        'amp': not args.no_amp,
     }
     meta.update(meta_extra)
     _dump_json(path, meta)
@@ -490,9 +533,12 @@ def main():
         print('  Run --smoke on the GPU host to verify the full path.')
         return
 
-    device = resolve_device(args.device)
-    if not _torch_available():
-        raise SystemExit('No CUDA torch found (run from the Kaggle/Colab notebook).')
+    device = args.device if args.device else resolve_device(None)
+    if device == 'cuda' and not _torch_available():
+        raise SystemExit('CUDA was selected but torch.cuda.is_available() is False; '
+                         're-run with --device cpu.')
+    if device == 'cpu' and args.device is None:
+        print('NOTE: no CUDA torch on this host; using --device cpu (slow).')
     amp = not args.no_amp and device == 'cuda'
     print(f'SetFit baseline | device: {device} | mixed precision: {"ON (fp16)" if amp else "off"}')
     print(f'languages: {args.languages if args.languages else "EN IT NL"} | '
@@ -511,8 +557,20 @@ def main():
         df_all = df_all.sample(n=min(args.smoke, len(df_all)),
                                random_state=args.seed).reset_index(drop=True)
     df_train, df_val = data_mod.split_by_video(df_all, args.val_fraction, args.split_seed)
-    n_classes = int(df_train['st_y'].nunique())
+    train_classes = set(int(c) for c in df_train['st_y'].unique())
+    val_classes = set(int(c) for c in df_val['st_y'].unique())
+    if train_classes != val_classes:
+        msg = (f'Class sets differ across splits: train {sorted(train_classes)} vs '
+               f'val {sorted(val_classes)}; macro-F1 would average over different class sets.')
+        if args.smoke:
+            print(f'WARNING: {msg}')
+        else:
+            raise RuntimeError(msg)
+    classes = sorted(train_classes | val_classes)
+    n_classes = len(classes)
     dist = {str(k): int(v) for k, v in df_train['st_y'].value_counts().items()}
+    print(f'Label sets after split: train {sorted(train_classes)} | val {sorted(val_classes)} | '
+          f'fixed class list for macro-F1: {classes}')
     print(f'Train: {len(df_train)} | Val: {len(df_val)} | st_y classes: {n_classes} | '
           f'train label counts: {dist}')
 
@@ -526,6 +584,7 @@ def main():
 
     model = build_setfit_model(args, st, device, n_classes)
     model.to(device)
+    api_check = check_setfit_api(model)
 
     started = time.time()
     if args.head_only:
@@ -541,10 +600,10 @@ def main():
         print('Contrastive phase done.')
 
     history, best_epoch = train_classifier_phase(
-        args, model, train_texts, train_labels, val_texts, val_labels, device)
+        args, model, train_texts, train_labels, val_texts, val_labels, classes, device)
     print(f'Classifier phase done in {time.time() - started:.0f}s')
 
-    metrics = evaluate(model, val_texts, val_labels)
+    metrics = evaluate(model, val_texts, val_labels, classes)
     print('--- VALIDATION (best-epoch head) ---')
     for key, value in metrics.items():
         if key not in ('preds', 'labels'):
@@ -554,7 +613,7 @@ def main():
     for lang in sorted(df_val['lang'].unique()):
         rows = df_val['lang'] == lang
         lm = evaluate(model, [t for t, keep in zip(val_texts, rows) if keep],
-                      df_val.loc[rows, 'st_y'].values)
+                      df_val.loc[rows, 'st_y'].values, classes)
         per_lang[lang] = {k: round(float(v), 6)
                           for k, v in lm.items() if k not in ('preds', 'labels')}
         print(f"  [{lang}] acc {lm['acc']:.4f} | macro_f1 {lm['macro_f1']:.4f}")
@@ -577,6 +636,11 @@ def main():
 
     write_run_metadata(args, {
         'model_id': used_backbone,
+        'device': device,
+        'amp': bool(amp),
+        'classes': classes,
+        'label_sets_match': bool(train_classes == val_classes),
+        'api_check': api_check,
         'n_classes': n_classes,
         'train_size': int(len(df_train)),
         'val_size': int(len(df_val)),
@@ -598,7 +662,9 @@ def main():
         print('Reload check: SetFitModel.from_pretrained ->')
         reloaded = SetFitModel.from_pretrained(args.out)
         reloaded.to('cpu')
-        proba = np.asarray(reloaded.predict_proba(val_texts[: min(8, len(val_texts))]))
+        proba = np.asarray(reloaded.predict_proba(
+            val_texts[: min(8, len(val_texts))],
+            as_numpy=True, show_progress_bar=False), dtype=np.float64)
         print(f'  predict_proba on {proba.shape[0]} val rows -> shape {proba.shape}')
 
 
