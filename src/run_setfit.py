@@ -12,15 +12,21 @@ The modern SetFit v2 API is used:
   * `SetFitModel(model_body=<SentenceTransformer>, model_head=<head>)`
   * `Trainer` + `TrainingArguments` + `datasets.Dataset`
   * contrastive embedding phase via `Trainer.train_embeddings(...)`
-  * classifier head trained separately so each epoch logs validation macro-F1:
+  * classifier head trained separately so each epoch logs validation macro-F1.
+    DESIGN A (fixed embeddings): the frozen body is kept in eval() mode over the
+    whole head phase and train/val embeddings are pre-encoded once, so the same
+    input always yields the same embedding (no backbone dropout, no gradients
+    through the body). This is deliberately NOT SetFit's default `fit`, which
+    puts the frozen body in train() mode and lets dropout add regularization
+    noise during the "frozen-weight" phase.
       - `--head torch`: a `SetFitHead` (CrossEntropyLoss) trained for up to
         `--head-epochs` epochs with `--patience` early stopping; the best-epoch
         head is restored and saved. This is implemented in this script (not by
         the library), so the per-epoch history is real.
       - `--head lr`: sklearn `LogisticRegression` (single fit; epochs, batch
         size and patience are N/A, tune `--lr-c` / `--lr-max-iter` instead).
-  * `--head-only` calls the head phase directly on frozen (pretrained) body
-    embeddings with NO contrastive phase -- the non-contrastive control.
+  * `--head-only` calls the head phase directly on the pretrained body with NO
+    contrastive phase -- the non-contrastive control.
   * `model.save_pretrained(<dir>)` / `SetFitModel.from_pretrained(<dir>)`.
 
 `--label-column` is honoured by `data.load_frame`: it encodes the chosen column
@@ -272,14 +278,6 @@ def make_trainer(args, model, training_args):
     return Trainer(model=model, args=training_args)
 
 
-def predict_labels(model, texts):
-    import numpy as np
-
-    preds = model.predict(list(texts), use_labels=False,
-                          as_numpy=True, show_progress_bar=False)
-    return np.asarray(preds, dtype=int)
-
-
 def evaluate(model, texts, labels, classes=None):
     """Multi-class evaluation over a FIXED class list. Handles (n,), (n,1)
     and (n,k>=2) proba shapes; macro-averaging always uses `classes` so runs
@@ -325,54 +323,67 @@ def evaluate(model, texts, labels, classes=None):
 
 def train_classifier_phase(args, model, train_texts, train_labels,
                            val_texts, val_labels, classes, device):
-    """Trains only the classifier head on frozen body embeddings.
+    """Trains only the classifier head -- DESIGN A: fixed embeddings.
 
-    The frozen body is kept in eval() mode throughout (dropout of the backbone
-    is OFF), so the embeddings feeding the head are deterministic -- this is
-    what makes the head-only baseline a true "fixed embeddings" control.
+    The frozen body is kept in eval() mode and NEVER receives a gradient and
+    NEVER runs dropout. Train and validation texts are embedded ONCE before
+    training (cached), so "frozen backbone" AND "fixed embeddings" both hold:
+    the same input always yields the same embedding. The head then trains on
+    the cached embeddings only. This is the strict interpretation of the
+    "head-only on (deterministically) fixed pretrained embeddings" control --
+    distinctly NOT SetFit's default `fit` (which sets `model_body.train()` and
+    lets dropout inject regularization noise during the frozen-weight phase).
 
     torch head: per-epoch loop logging validation macro-F1/acc (macro-averaged
     over the fixed `classes` list), with `--patience` early stopping and
     best-epoch head restore. Returns the real per-epoch history and the best
-    epoch.
-    lr head: single sklearn fit; returns an empty history (one metrics row is
-    appended by the caller).
+    epoch. The body stays frozen on return (trainability state matches the
+    declared frozen-body design).
+    lr head: single sklearn fit on the cached embeddings; returns an empty
+    history (one metrics row is appended by the caller).
     """
     import torch
     from sklearn.metrics import accuracy_score, f1_score
 
-    model.model_body.eval()  # deterministic frozen embeddings for both heads
+    model.model_body.eval()  # dropout off, deterministic embeddings
 
     if args.head == 'lr':
-        print(f'Training {args.head} head: single LogisticRegression fit '
-              '(epochs/patience/batch are N/A; tune C and max_iter).')
+        print(f'Training {args.head} head (design A: fixed pretrained embeddings): '
+              'single LogisticRegression fit (epochs/patience/batch are N/A; '
+              'tune C and max_iter).')
+        model.freeze('body')  # body stays frozen on return: trainability matches design A
         model.fit(list(train_texts), list(train_labels), num_epochs=1,
                   show_progress_bar=True, end_to_end=False)
         return [], 0
 
-    print(f'Training torch head: up to {args.head_epochs} epoch(s), '
-          f'patience {args.patience}, batch {args.batch_size}, '
-          f'lr {args.head_learning_rate} (frozen body in eval() mode).')
+    print(f'Training torch head (design A: fixed embeddings): up to '
+          f'{args.head_epochs} epoch(s), patience {args.patience}, batch '
+          f'{args.batch_size}, lr {args.head_learning_rate}.')
     model.freeze('body')
-    dataloader = model._prepare_dataloader(
-        list(train_texts), list(train_labels), args.batch_size, args.max_seq_length)
+
+    with torch.no_grad():
+        train_emb = model.encode(list(train_texts), batch_size=args.batch_size,
+                                 show_progress_bar=False)
+        val_emb = model.encode(list(val_texts), batch_size=args.batch_size,
+                               show_progress_bar=False)
+
+    dataset = torch.utils.data.TensorDataset(train_emb, torch.as_tensor(train_labels))
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size,
+                                             shuffle=True)
     criterion = model.model_head.get_loss_fn()
-    optimizer = model._prepare_optimizer(args.head_learning_rate, None, 0.01)
+    optimizer = torch.optim.AdamW(model.model_head.parameters(),
+                                  lr=args.head_learning_rate, weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
+    val_emb = val_emb.to(device)
     history, best_macro, best_state, best_epoch, wait = [], -1.0, None, 0, 0
     for epoch in range(1, args.head_epochs + 1):
         model.model_head.train()
         total_loss, n_batches = 0.0, 0
-        for features, labels in dataloader:
-            features = {k: v.to(device) for k, v in features.items()}
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            outputs = model.model_body(features)
-            if model.normalize_embeddings:
-                outputs['sentence_embedding'] = torch.nn.functional.normalize(
-                    outputs['sentence_embedding'], p=2, dim=1)
-            outputs = model.model_head(outputs)
+        for emb, labels in dataloader:
+            emb, labels = emb.to(device), labels.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model.model_head({'sentence_embedding': emb})
             loss = criterion(outputs['logits'], labels)
             loss.backward()
             optimizer.step()
@@ -381,7 +392,9 @@ def train_classifier_phase(args, model, train_texts, train_labels,
         scheduler.step()
 
         model.model_head.eval()
-        preds = predict_labels(model, val_texts)
+        with torch.no_grad():
+            logits = model.model_head({'sentence_embedding': val_emb})['logits']
+        preds = logits.argmax(dim=-1).cpu().numpy()
         macro = float(f1_score(val_labels, preds, labels=classes,
                                average='macro', zero_division=0))
         acc = float(accuracy_score(val_labels, preds))
@@ -411,7 +424,7 @@ def train_classifier_phase(args, model, train_texts, train_labels,
                 p.copy_(best_state[name])
         print(f'Restored best head from epoch {best_epoch} '
               f'(val_macro_f1 {best_macro:.4f})')
-    model.unfreeze('body')
+    model.model_head.eval()
     return history, best_epoch
 
 
@@ -528,12 +541,11 @@ def check_setfit_api(model):
     from setfit import SetFitModel
 
     api = {}
-    for name in ['model_body', 'model_head', 'freeze', 'normalize_embeddings'] + \
-                ['_prepare_dataloader', '_prepare_optimizer']:
+    for name in ['model_body', 'model_head', 'freeze', 'normalize_embeddings']:
         api[name] = hasattr(model, name)
         if not api[name]:
             raise RuntimeError(
-                f'setfit missing {name} -- private API drifted in setfit/'
+                f'setfit missing {name} -- API drifted in setfit/'
                 'sentence-transformers. Align run_setfit.py with the pinned '
                 'versions (see requirements.txt) BEFORE treating any result as '
                 'reproducible.')
@@ -574,6 +586,7 @@ def write_run_metadata(args, meta_extra: dict, path: str) -> None:
         'val_fraction': args.val_fraction,
         'head': args.head,
         'head_only': args.head_only,
+        'head_phase_design': 'A_fixed_embeddings',
         'backbone': args.backbone,
         'contrastive_epochs': args.contrastive_epochs,
         'num_iterations': args.num_iterations if not args.head_only else None,
@@ -651,8 +664,9 @@ def main():
 
     started = time.time()
     if args.head_only:
-        print('HEAD-ONLY: skipping the contrastive phase; training the classifier head on frozen '
-              'pretrained embeddings (the non-contrastive control).')
+        print('HEAD-ONLY (design A, fixed embeddings): skipping the contrastive phase; '
+              'training the classifier head on deterministic pretrained embeddings '
+              '(body eval(), no dropout, no gradients) -- the non-contrastive control.')
     else:
         training_args = make_training_args(args, amp)
         trainer = make_trainer(args, model, training_args)
