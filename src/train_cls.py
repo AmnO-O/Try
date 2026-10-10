@@ -62,6 +62,9 @@ def parse_args(argv=None):
     parser.add_argument('--lr', type=float, default=BACKBONE_LR, help='Learning rate (all trainable params)')
     parser.add_argument('--weight-decay', type=float, default=WEIGHT_DECAY)
     parser.add_argument('--unfreeze-layers', type=int, default=UNFREEZE_LAYERS, help='0 freezes all of mmBERT')
+    parser.add_argument('--readout-init', choices=('random', 'verbalizer'), default='random',
+                        help="Classifier head init: 'random', or 'verbalizer' = seed the two rows "
+                             "from the pretrained embeddings of the label words ' no'/' yes'")
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--out', default=None, help='Checkpoint path (state dict)')
@@ -225,7 +228,7 @@ def main():
 
     from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
                              Trainer, TrainingArguments)
-    from model import unfreeze_last_n
+    from model import unfreeze_last_n, label_token_ids
     try:
         from transformers.integrations import EarlyStoppingCallback
         can_early_stop = True
@@ -240,6 +243,13 @@ def main():
     if args.from_checkpoint:
         model.load_state_dict(torch.load(args.from_checkpoint, map_location='cpu'))
         print(f'  resumed from checkpoint: {args.from_checkpoint}')
+
+    if args.readout_init == 'verbalizer':
+        ids = label_token_ids(tokenizer)
+        emb = model.get_input_embeddings().weight
+        with torch.no_grad():
+            model.classifier.weight.copy_(emb[ids].detach())
+        print(f'  readout: verbalizer (label word ids {ids}) seeded from pretrained embeddings')
 
     n_blocks = unfreeze_last_n(model.base_model, args.unfreeze_layers)
     for param in model.classifier.parameters():
