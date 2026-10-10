@@ -4,9 +4,8 @@
 
 Translates comments per (src, tgt) pair driven by --plan. Gold labels
 (stereotype/hate_speech/target) travel with the row; only yt_comment is
-rewritten, same convention as gen_llm_data.py --mode translate. Outputs are
-schema-compatible TSVs for train.py --train-extras, with the target language
-in the filename.
+rewritten. Outputs are schema-compatible TSVs for train.py --train-extras,
+with the target language in the filename.
 
 Needs the model's HF license accepted (gated repo); `huggingface-cli login`.
 
@@ -26,7 +25,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import src.data as data_mod
-from src.gen_llm_data import infer_lang, read_tsv, write_tsv
+from src.tsv_io import infer_lang, read_tsv, write_tsv
 
 MODEL_NAME = 'facebook/nllb-200-distilled-1.3B'
 LANG_CODES = {'EN': 'eng_Latn', 'IT': 'ita_Latn', 'NL': 'nld_Latn'}

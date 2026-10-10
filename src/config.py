@@ -24,8 +24,6 @@ WEIGHTS_DIR = os.environ.get('LGBT_WEIGHTS_DIR', os.path.join(REPO_ROOT, 'weight
 TRAIN_GLOB = 'StereoQueerEval_*_training.tsv'
 LANGUAGES = ('EN', 'IT', 'NL')
 
-STEREOTYPE_VALUES = ('yes', 'no')
-
 REQUIRED_COLUMNS = [
     'StereoQueerEval_id',
     'yt_title',
@@ -77,7 +75,6 @@ DEFAULT_PROMPT = PROMPT_TEMPLATES['EN']
 # MODEL
 # -----------------------------------------------------------------------------
 MMBERT_MODEL_NAME = 'jhu-clsp/mmbert-base'
-HIDDEN_DIM = 768
 MAX_LEN = 320
 SEP_TOKEN = '[SEP]'
 
@@ -115,8 +112,6 @@ PATIENCE = 5
 VAL_FRACTION = 0.1
 SPLIT_SEED = 42
 WEIGHT_DECAY = 0.01
-
-BEST_WEIGHTS = os.path.join(WEIGHTS_DIR, 'best_mmbert_stereotype_prompt.pt')
 
 
 def best_weights_path(readout_init: str = READOUT_INIT) -> str:
