@@ -23,6 +23,11 @@ The modern SetFit v2 API is used:
         `--head-epochs` epochs with `--patience` early stopping; the best-epoch
         head is restored and saved. This is implemented in this script (not by
         the library), so the per-epoch history is real.
+      - `--head mlp`: same training loop, but the head is a 2-layer MLP
+        `Linear(emb, --mlp-hidden) -> GELU -> Dropout(--mlp-dropout) ->
+        Linear(hidden, 2)` instead of the single linear probe. A higher-capacity
+        alternative to A/B on the cached embeddings (`--mlp-hidden`,
+        `--mlp-dropout`).
       - `--head lr`: sklearn `LogisticRegression` (single fit; epochs, batch
         size and patience are N/A, tune `--lr-c` / `--lr-max-iter` instead).
   * `--head-only` calls the head phase directly on the pretrained body with NO
@@ -62,7 +67,7 @@ language and warns about rows that hit the tokenizer cap.
 Usage:
     python src/run_setfit.py --split-seed 40 --seed 40 --out weights/setfit_s40_seed40
     python src/run_setfit.py --dry-run            # config only, no torch/setfit
-    python src/run_setfit.py --smoke 256 --num-iterations 1 --head-epochs 2
+    python src/run_setfit.py --head mlp --head-only --out weights/setfit_s40_mlp
     python src/run_setfit.py --head lr --head-only --out weights/setfit_s40_lr
 """
 
@@ -102,10 +107,13 @@ def parse_args(argv=None):
                         help='Word budget used by the same PromptBudget as train.py')
     parser.add_argument('--max-seq-length', type=int, default=384,
                         help='Tokenizer truncation cap passed to the SentenceTransformer body')
-    parser.add_argument('--head', choices=('torch', 'lr'), default='torch',
-                        help="Classifier head: 'torch' SetFitHead (per-epoch training, --head-epochs + "
-                             "--patience early stopping) or 'lr' sklearn LogisticRegression "
-                             "(single fit, tuned via --lr-c / --lr-max-iter)")
+    parser.add_argument('--head', choices=('torch', 'lr', 'mlp'), default='torch',
+                        help="Classifier head: 'torch' SetFitHead = a single Linear(emb, 2) "
+                             "(per-epoch training, --head-epochs + --patience early stopping); "
+                             "'mlp' Linear(emb,hidden) -> GELU -> Dropout -> Linear(hidden,2) "
+                             "(same training loop, tuned via --mlp-hidden / --mlp-dropout); "
+                             "'lr' sklearn LogisticRegression (single fit, tuned via "
+                             "--lr-c / --lr-max-iter)")
     parser.add_argument('--contrastive-epochs', type=int, default=1,
                         help='Embedding-phase epochs (contrastive fine-tuning of the body)')
     parser.add_argument('--num-iterations', type=int, default=5,
@@ -126,6 +134,10 @@ def parse_args(argv=None):
                         help='Body learning rate (embedding contrastive phase)')
     parser.add_argument('--head-learning-rate', type=float, default=1e-2,
                         help='Learning rate for the torch classifier head')
+    parser.add_argument('--mlp-hidden', type=int, default=256,
+                        help="Hidden width for '--head mlp' (only used with --head mlp)")
+    parser.add_argument('--mlp-dropout', type=float, default=0.2,
+                        help="Dropout probability between the two MLP layers ('--head mlp' only)")
     parser.add_argument('--lr-c', type=float, default=1.0,
                         help='Inverse regularization strength for the logistic-regression head (--head lr)')
     parser.add_argument('--lr-max-iter', type=int, default=1000,
@@ -156,6 +168,10 @@ def parse_args(argv=None):
         parser.error('--num-iterations must be >= 1')
     if args.head_epochs < 1:
         parser.error('--head-epochs must be >= 1')
+    if args.head == 'mlp' and args.mlp_hidden < 1:
+        parser.error('--mlp-hidden must be >= 1')
+    if not 0.0 <= args.mlp_dropout < 1.0:
+        parser.error('--mlp-dropout must be in [0, 1)')
     if args.smoke and args.smoke < 8:
         parser.error('--smoke must be >= 8 rows')
     return args
@@ -163,6 +179,46 @@ def parse_args(argv=None):
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
+
+
+# Defined lazily (first `--head mlp` use) so `--dry-run` / `--help` stay free of
+# torch + setfit. Registered on the module as `MLPHead` so it stays picklable by
+# reference for save_pretrained -> from_pretrained in the same process.
+MLPHead = None
+
+
+def _mlp_head_cls():
+    """Build (once) an MLP classifier head as a `SetFitHead` subclass.
+
+    `SetFitHead` already provides everything the Design-A head loop needs
+    (forward({'sentence_embedding': x}) -> logits, predict_proba, get_loss_fn,
+    .to/.train/.eval), so we only swap its single `nn.Linear` for a 2-layer MLP:
+    Linear(in, hidden) -> GELU -> Dropout -> Linear(hidden, out). The inherited
+    forward still applies the same temperature scaling to the final logits.
+    """
+    global MLPHead
+    if MLPHead is not None:
+        return MLPHead
+    import torch.nn as nn
+    from setfit.modeling import SetFitHead
+
+    class MLPHead(SetFitHead):  # noqa: F811
+        def __init__(self, in_features, out_features, hidden=256, dropout=0.2, device=None):
+            super().__init__(in_features=in_features, out_features=out_features, device=device)
+            self.hidden = hidden
+            self.dropout = dropout
+            self.linear = nn.Sequential(
+                nn.Linear(in_features, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, out_features),
+            )
+            self.to(self._device)
+            self.apply(self._init_weight)
+
+    MLPHead.__module__ = __name__
+    MLPHead.__qualname__ = 'MLPHead'
+    return MLPHead
 
 
 def resolve_device(name):
@@ -226,15 +282,18 @@ def build_sentence_model(args):
 
 
 def build_setfit_model(args, st, device, n_classes: int):
-    if args.head == 'torch':
+    if args.head in ('torch', 'mlp'):
         from setfit import SetFitHead, SetFitModel
 
-        head = SetFitHead(
+        head_cls = SetFitHead if args.head == 'torch' else _mlp_head_cls()
+        head_kwargs = dict(
             in_features=st.get_sentence_embedding_dimension(),
             out_features=n_classes,
             device=device,
         )
-        return SetFitModel(model_body=st, model_head=head)
+        if args.head == 'mlp':
+            head_kwargs.update(hidden=args.mlp_hidden, dropout=args.mlp_dropout)
+        return SetFitModel(model_body=st, model_head=head_cls(**head_kwargs))
 
     from sklearn.linear_model import LogisticRegression
     from setfit import SetFitModel
@@ -358,7 +417,7 @@ def train_classifier_phase(args, model, train_texts, train_labels,
                   show_progress_bar=True, end_to_end=False)
         return [], 0
 
-    print(f'Training torch head (design A: fixed embeddings): up to '
+    print(f'Training {args.head} head (design A: fixed embeddings): up to '
           f'{args.head_epochs} epoch(s), patience {args.patience}, batch '
           f'{args.batch_size}, lr {args.head_learning_rate}.')
     model.freeze('body')
@@ -589,6 +648,8 @@ def write_run_metadata(args, meta_extra: dict, path: str) -> None:
         'head': args.head,
         'head_only': args.head_only,
         'head_phase_design': 'A_fixed_embeddings',
+        'mlp_hidden': args.mlp_hidden if args.head == 'mlp' else None,
+        'mlp_dropout': args.mlp_dropout if args.head == 'mlp' else None,
         'backbone': args.backbone,
         'contrastive_epochs': args.contrastive_epochs,
         'num_iterations': args.num_iterations if not args.head_only else None,
