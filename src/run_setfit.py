@@ -149,6 +149,13 @@ def parse_args(argv=None):
                              '16 GB T4; raise it only if you have headroom, lower it on OOM.')
     parser.add_argument('--learning-rate', type=float, default=2e-5,
                         help='Body learning rate (embedding contrastive phase)')
+    parser.add_argument('--lr-scale', choices=['none', 'linear', 'sqrt'], default='none',
+                        help="Scale the body lr with --contrastive-batch-size relative to "
+                             "--lr-base-batch (linear: lr * batch/base; sqrt: lr * sqrt(batch/base)). "
+                             "Compensates for the fewer optimizer steps a larger batch gives. "
+                             "Default none (use --learning-rate verbatim).")
+    parser.add_argument('--lr-base-batch', type=int, default=8,
+                        help='Reference batch that --learning-rate was tuned at (default 8)')
     parser.add_argument('--unfreeze-body-layers', type=int, default=None,
                         help='Contrastive-phase only: fine-tune just the last k encoder blocks of the '
                              'body (plus pooling) instead of the whole body. Cuts activation + optimizer '
@@ -383,15 +390,27 @@ def build_texts(df, data_mod, max_len: int) -> list:
     return texts
 
 
+def effective_learning_rate(args) -> float:
+    """Scale --learning-rate with the contrastive batch size to offset the fewer
+    optimizer steps a larger batch yields. 'none' returns it verbatim."""
+    if getattr(args, 'lr_scale', 'none') == 'none':
+        return args.learning_rate
+    base = max(1, args.lr_base_batch)
+    ratio = args.contrastive_batch_size / base
+    factor = ratio if args.lr_scale == 'linear' else ratio ** 0.5
+    return args.learning_rate * factor
+
+
 def make_training_args(args, amp: bool):
     from setfit import TrainingArguments
 
+    body_lr = effective_learning_rate(args)
     return TrainingArguments(
         output_dir=os.path.join(os.path.dirname(args.out) or '.', 'setfit_checkpoints'),
         batch_size=(args.contrastive_batch_size, args.batch_size),
         num_epochs=(args.contrastive_epochs, args.head_epochs),
         num_iterations=args.num_iterations,
-        body_learning_rate=(args.learning_rate, args.learning_rate),
+        body_learning_rate=(body_lr, body_lr),
         head_learning_rate=args.head_learning_rate,
         seed=args.seed,
         use_amp=amp,
@@ -729,6 +748,9 @@ def write_run_metadata(args, meta_extra: dict, path: str) -> None:
         'batch_size': args.batch_size,
         'contrastive_batch_size': args.contrastive_batch_size,
         'learning_rate': args.learning_rate,
+        'learning_rate_effective': effective_learning_rate(args),
+        'lr_scale': args.lr_scale,
+        'lr_base_batch': args.lr_base_batch,
         'body_unfreeze_layers': args.unfreeze_body_layers,
         'head_learning_rate': args.head_learning_rate,
         'lr_c': args.lr_c,
@@ -857,8 +879,12 @@ def main():
               f'seed: {args.seed} | head: {args.head} | head_only: {args.head_only} | '
               f'out: {args.out}')
         print(f'  contrastive: {args.contrastive_epochs} epoch(s) x {args.num_iterations} iters '
-              f'(batch {args.contrastive_batch_size}) | head: {args.head_epochs} epoch(s) '
+              f'(batch {args.contrastive_batch_size}, lr {effective_learning_rate(args)}) | head: '
+              f'{args.head_epochs} epoch(s) '
               f'(batch {args.batch_size}, lr {args.head_learning_rate}, patience {args.patience})')
+        if args.lr_scale != 'none':
+            print(f'  lr scaled {args.lr_scale} from {args.learning_rate} at base batch '
+                  f'{args.lr_base_batch} -> {effective_learning_rate(args)}')
         if args.unfreeze_body_layers is not None:
             print(f'  contrastive body: last {args.unfreeze_body_layers} encoder block(s) '
                   f'+ pooling trainable (partial fine-tuning)')
@@ -941,7 +967,11 @@ def main():
         trainer = make_trainer(args, model, training_args)
         print(f'Contrastive embedding phase: {args.contrastive_epochs} epoch(s) x '
               f'{args.num_iterations} iterations, batch {args.contrastive_batch_size}, '
-              f'lr {args.learning_rate}, amp {"on" if amp else "off"}.')
+              f'lr {effective_learning_rate(args)}, amp {"on" if amp else "off"}.')
+        if args.lr_scale != 'none':
+            print(f'  lr scaled {args.lr_scale} from {args.learning_rate} at base batch '
+                  f'{args.lr_base_batch} -> {effective_learning_rate(args)} '
+                  f'(batch {args.contrastive_batch_size})')
         if args.unfreeze_body_layers is not None:
             print(f'  contrastive body: last {args.unfreeze_body_layers} encoder block(s) '
                   f'+ pooling trainable (partial fine-tuning)')
