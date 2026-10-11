@@ -35,6 +35,12 @@ The modern SetFit v2 API is used:
   * `--body-from <dir>` reuses a body saved by a previous run (save_pretrained
     `<out>/`) and skips the contrastive phase, so heads can be swapped cheaply
     on the SAME trained body (one contrastive run, many head A/Bs).
+  * `--unfreeze-body-layers k` fine-tunes only the last k encoder blocks of the
+    body (plus the pooling module) in the contrastive phase, instead of the whole
+    body: fewer trainable params -> smaller activation + optimizer footprint ->
+    a larger contrastive batch fits a 16 GB T4. Unset = stock SetFit (whole body);
+    `k = 0` = fully frozen body. Applied in the contrastive phase ONLY; the
+    Design-A head phase still freezes the whole body.
   * `--head-sweep` trains several heads (list via `--sweep-heads`, e.g.
     `torch,mlp,lr:0.1,lr:1,lr:10`) on the SAME body and prints one comparison
     table; still a single contrastive run.
@@ -77,6 +83,8 @@ Usage:
     python src/run_setfit.py --head lr --head-only --out weights/setfit_s40_lr
     python src/run_setfit.py --body-from weights/setfit_s40_seed40 --head mlp --out weights/setfit_s40_mlp
     python src/run_setfit.py --head-sweep --out weights/setfit_s40_seed40
+    python src/run_setfit.py --unfreeze-body-layers 2 --out weights/setfit_s40_tail2
+    python src/run_setfit.py --unfreeze-body-layers 0 --out weights/setfit_s40_frozen
 """
 
 import argparse
@@ -141,6 +149,12 @@ def parse_args(argv=None):
                              '16 GB T4; raise it only if you have headroom, lower it on OOM.')
     parser.add_argument('--learning-rate', type=float, default=2e-5,
                         help='Body learning rate (embedding contrastive phase)')
+    parser.add_argument('--unfreeze-body-layers', type=int, default=None,
+                        help='Contrastive-phase only: fine-tune just the last k encoder blocks of the '
+                             'body (plus pooling) instead of the whole body. Cuts activation + optimizer '
+                             'memory so a larger contrastive batch fits a 16 GB T4. 0 = fully frozen body; '
+                             'unset = stock SetFit (train the whole body). Ignored with --head-only / '
+                             '--body-from (no contrastive phase).')
     parser.add_argument('--head-learning-rate', type=float, default=1e-2,
                         help='Learning rate for the torch classifier head')
     parser.add_argument('--mlp-hidden', type=int, default=256,
@@ -184,6 +198,8 @@ def parse_args(argv=None):
         args.out = f'weights/setfit_s{args.split_seed}_seed{args.seed}'
     if args.num_iterations < 1 and not args.head_only:
         parser.error('--num-iterations must be >= 1')
+    if args.unfreeze_body_layers is not None and args.unfreeze_body_layers < 0:
+        parser.error('--unfreeze-body-layers must be >= 0')
     if args.head_epochs < 1:
         parser.error('--head-epochs must be >= 1')
     if args.head == 'mlp' and args.mlp_hidden < 1:
@@ -304,6 +320,35 @@ def build_sentence_model(args):
     print(f'Backbone: {backbone} | max_seq_length: {st.max_seq_length} | '
           f'embedding dim: {st.get_sentence_embedding_dimension()} | dtype: fp32')
     return st, backbone
+
+
+def apply_body_unfreeze(body, n_layers: int) -> int:
+    """Partial-body contrastive fine-tuning: unfreeze the last `n_layers` encoder
+    blocks (reusing model.unfreeze_last_n's name-based block detection) plus the
+    trailing pooling module; everything else stays frozen.
+
+    Freezing the lower blocks AND the word/position embeddings keeps their output
+    free of `requires_grad`, so autograd never builds a graph through them, their
+    activations are not stored, and AdamW never allocates state for them -- the
+    levers that make a 307M backbone fit a larger contrastive batch. Returns the
+    number of encoder blocks actually unfrozen.
+    """
+    from model import unfreeze_last_n
+
+    total_blocks = unfreeze_last_n(body, n_layers)
+    n_unfrozen = min(n_layers, total_blocks) if n_layers > 0 else 0
+
+    # Re-enable the trailing pooling module: param-free for mean pooling, but a
+    # weighted/attention pooling carries weights that must train with the blocks.
+    for param in body[-1].parameters():
+        param.requires_grad = True
+
+    trainable = sum(p.numel() for p in body.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in body.parameters())
+    pct = 100.0 * trainable / total if total else 0.0
+    print(f'Partial body: unfroze last {n_unfrozen}/{total_blocks} encoder block(s) '
+          f'+ pooling | trainable body params {trainable:,}/{total:,} ({pct:.1f}%)')
+    return n_unfrozen
 
 
 def build_setfit_model(args, st, device, n_classes: int):
@@ -684,6 +729,7 @@ def write_run_metadata(args, meta_extra: dict, path: str) -> None:
         'batch_size': args.batch_size,
         'contrastive_batch_size': args.contrastive_batch_size,
         'learning_rate': args.learning_rate,
+        'body_unfreeze_layers': args.unfreeze_body_layers,
         'head_learning_rate': args.head_learning_rate,
         'lr_c': args.lr_c,
         'lr_max_iter': args.lr_max_iter,
@@ -813,6 +859,9 @@ def main():
         print(f'  contrastive: {args.contrastive_epochs} epoch(s) x {args.num_iterations} iters '
               f'(batch {args.contrastive_batch_size}) | head: {args.head_epochs} epoch(s) '
               f'(batch {args.batch_size}, lr {args.head_learning_rate}, patience {args.patience})')
+        if args.unfreeze_body_layers is not None:
+            print(f'  contrastive body: last {args.unfreeze_body_layers} encoder block(s) '
+                  f'+ pooling trainable (partial fine-tuning)')
         if args.head_sweep:
             print(f'  head sweep: {args.sweep_heads} (one body, one table)')
         print('  Run --smoke on the GPU host to verify the full path.')
@@ -875,12 +924,19 @@ def main():
         reason = '--head-only' if args.head_only else f'--body-from {args.body_from}'
         print(f'Skipping the contrastive phase ({reason}): training the classifier head '
               'on deterministic frozen embeddings (body eval(), no dropout, no gradients).')
+        if args.unfreeze_body_layers is not None:
+            print('NOTE: --unfreeze-body-layers is ignored (no contrastive phase).')
     else:
+        if args.unfreeze_body_layers is not None:
+            apply_body_unfreeze(model.model_body, args.unfreeze_body_layers)
         training_args = make_training_args(args, amp)
         trainer = make_trainer(args, model, training_args)
         print(f'Contrastive embedding phase: {args.contrastive_epochs} epoch(s) x '
               f'{args.num_iterations} iterations, batch {args.contrastive_batch_size}, '
               f'lr {args.learning_rate}, amp {"on" if amp else "off"}.')
+        if args.unfreeze_body_layers is not None:
+            print(f'  contrastive body: last {args.unfreeze_body_layers} encoder block(s) '
+                  f'+ pooling trainable (partial fine-tuning)')
         trainer.train_embeddings(train_texts, list(train_labels), args=training_args)
         print('Contrastive phase done.')
 
