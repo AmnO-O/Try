@@ -35,6 +35,9 @@ The modern SetFit v2 API is used:
   * `--body-from <dir>` reuses a body saved by a previous run (save_pretrained
     `<out>/`) and skips the contrastive phase, so heads can be swapped cheaply
     on the SAME trained body (one contrastive run, many head A/Bs).
+  * `--head-sweep` trains several heads (list via `--sweep-heads`, e.g.
+    `torch,mlp,lr:0.1,lr:1,lr:10`) on the SAME body and prints one comparison
+    table; still a single contrastive run.
   * `model.save_pretrained(<dir>)` / `SetFitModel.from_pretrained(<dir>)`.
 
 `--label-column` is honoured by `data.load_frame`: it encodes the chosen column
@@ -73,9 +76,11 @@ Usage:
     python src/run_setfit.py --head mlp --head-only --out weights/setfit_s40_mlp
     python src/run_setfit.py --head lr --head-only --out weights/setfit_s40_lr
     python src/run_setfit.py --body-from weights/setfit_s40_seed40 --head mlp --out weights/setfit_s40_mlp
+    python src/run_setfit.py --head-sweep --out weights/setfit_s40_seed40
 """
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -153,6 +158,11 @@ def parse_args(argv=None):
                         help='Directory of a body saved by a previous run (save_pretrained <out>/). Reuses the '
                              'already-trained contrastive body and skips the contrastive phase, so different '
                              'heads can be A/B-tested cheaply on the SAME body.')
+    parser.add_argument('--head-sweep', action='store_true',
+                        help='Train several heads on the SAME body (contrastive phase runs once) and print a '
+                             'comparison table. Uses --sweep-heads; --head is ignored in this mode.')
+    parser.add_argument('--sweep-heads', default='torch,mlp,lr:0.1,lr:1,lr:10',
+                        help="Comma list for --head-sweep: 'torch', 'mlp', 'lr' (uses --lr-c), or 'lr:<C>'")
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--seed', type=int, default=None,
@@ -682,6 +692,114 @@ def write_run_metadata(args, meta_extra: dict, path: str) -> None:
     _dump_json(path, meta)
 
 
+def parse_sweep_heads(spec: str, args):
+    """Expand a --sweep-heads string into (name, per-variant overrides) pairs.
+
+    Items: 'torch', 'mlp', 'lr' (uses --lr-c), or 'lr:<C>' (explicit C).
+    """
+    variants = []
+    for item in (s.strip() for s in spec.split(',')):
+        if not item:
+            continue
+        if item == 'torch':
+            variants.append(('torch', {'head': 'torch'}))
+        elif item == 'mlp':
+            variants.append(('mlp', {'head': 'mlp'}))
+        elif item == 'lr':
+            variants.append((f'lr_c{args.lr_c}', {'head': 'lr', 'lr_c': args.lr_c}))
+        elif item.startswith('lr:'):
+            c = float(item.split(':', 1)[1])
+            variants.append((f'lr_c{c}', {'head': 'lr', 'lr_c': c}))
+        else:
+            raise SystemExit(f'unknown --sweep-heads item {item!r} '
+                             "(use 'torch', 'mlp', 'lr', or 'lr:<C>')")
+    if not variants:
+        raise SystemExit('--sweep-heads is empty')
+    return variants
+
+
+def run_head_variant(args, st, used_backbone, device, amp, n_classes, classes,
+                     label_sets_ok, api_check, df_train, df_val, train_texts,
+                     val_texts, train_labels, val_labels, dist, token_audit, out,
+                     started):
+    """Build a head on the (frozen) body `st`, train it (Design A), evaluate,
+    save, and write history + metadata for one head configuration.
+
+    Reuses the SAME body for every call, so `--head-sweep` pays the contrastive
+    phase once and only re-trains heads. Returns a summary dict for the table.
+    """
+    model = build_setfit_model(args, st, device, n_classes)
+    model.to(device)
+
+    history, best_epoch = train_classifier_phase(
+        args, model, train_texts, train_labels, val_texts, val_labels, classes, device)
+    print(f'Classifier phase done in {time.time() - started:.0f}s')
+
+    metrics = evaluate(model, val_texts, val_labels, classes)
+    print('--- VALIDATION (best-epoch head) ---')
+    for key, value in metrics.items():
+        if key not in ('preds', 'labels'):
+            print(f'  {key}: {value:.4f}')
+
+    per_lang = {}
+    for lang in sorted(df_val['lang'].unique()):
+        rows = df_val['lang'] == lang
+        lm = evaluate(model, [t for t, keep in zip(val_texts, rows) if keep],
+                      df_val.loc[rows, 'st_y'].values, classes)
+        per_lang[lang] = {k: round(float(v), 6)
+                          for k, v in lm.items() if k not in ('preds', 'labels')}
+        print(f"  [{lang}] acc {lm['acc']:.4f} | macro_f1 {lm['macro_f1']:.4f}")
+
+    if not history:
+        history = [{
+            'epoch': 1,
+            'train_loss': '',
+            'val_macro_f1': f"{metrics['macro_f1']:.6f}",
+            'val_acc': f"{metrics['acc']:.6f}",
+        }]
+
+    os.makedirs(out, exist_ok=True)
+    model.save_pretrained(out)
+    history_path = f'{out}_history.csv'
+    with open(history_path, 'w', encoding='utf-8', newline='') as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(history[0].keys()))
+        writer.writeheader()
+        writer.writerows(history)
+
+    write_run_metadata(args, {
+        'model_id': used_backbone,
+        'device': device,
+        'amp': bool(amp),
+        'classes': classes,
+        'label_sets_match': bool(label_sets_ok),
+        'api_check': api_check,
+        'n_classes': n_classes,
+        'train_size': int(len(df_train)),
+        'val_size': int(len(df_val)),
+        'train_label_counts': dist,
+        'val_label_counts': {str(k): int(v) for k, v in df_val['st_y'].value_counts().items()},
+        'best_epoch': best_epoch,
+        'val_metrics': {k: round(float(v), 6)
+                        for k, v in metrics.items() if k not in ('preds', 'labels')},
+        'per_language': per_lang,
+        'token_audit': token_audit,
+    }, f'{out}_run.json')
+
+    print(f'Saved model -> {out} (save_pretrained)')
+    print(f'Wrote history -> {history_path}')
+    print(f'Wrote metadata -> {out}_run.json')
+
+    return {
+        'out': out,
+        'head': args.head,
+        'lr_c': args.lr_c if args.head == 'lr' else None,
+        'best_epoch': best_epoch,
+        'val_macro_f1': float(metrics['macro_f1']),
+        'val_acc': float(metrics['acc']),
+        'per_language': per_lang,
+    }
+
+
 def main():
     args = parse_args()
 
@@ -695,6 +813,8 @@ def main():
         print(f'  contrastive: {args.contrastive_epochs} epoch(s) x {args.num_iterations} iters '
               f'(batch {args.contrastive_batch_size}) | head: {args.head_epochs} epoch(s) '
               f'(batch {args.batch_size}, lr {args.head_learning_rate}, patience {args.patience})')
+        if args.head_sweep:
+            print(f'  head sweep: {args.sweep_heads} (one body, one table)')
         print('  Run --smoke on the GPU host to verify the full path.')
         return
 
@@ -741,7 +861,12 @@ def main():
     st, used_backbone = build_sentence_model(args)
     token_audit = audit_token_lengths(val_texts, df_val['lang'].values, st, args.max_seq_length)
 
-    model = build_setfit_model(args, st, device, n_classes)
+    if args.head_sweep and not (args.head_only or args.body_from):
+        ctor_args = copy.deepcopy(args)
+        ctor_args.head = 'torch'  # contrastive phase is head-agnostic; train the body only
+    else:
+        ctor_args = args
+    model = build_setfit_model(ctor_args, st, device, n_classes)
     model.to(device)
     api_check = check_setfit_api(model)
 
@@ -759,63 +884,47 @@ def main():
         trainer.train_embeddings(train_texts, list(train_labels), args=training_args)
         print('Contrastive phase done.')
 
-    history, best_epoch = train_classifier_phase(
-        args, model, train_texts, train_labels, val_texts, val_labels, classes, device)
-    print(f'Classifier phase done in {time.time() - started:.0f}s')
+    common = dict(st=st, used_backbone=used_backbone, device=device, amp=amp,
+                  n_classes=n_classes, classes=classes, label_sets_ok=label_sets_ok,
+                  api_check=api_check, df_train=df_train, df_val=df_val,
+                  train_texts=train_texts, val_texts=val_texts, train_labels=train_labels,
+                  val_labels=val_labels, dist=dist, token_audit=token_audit)
 
-    metrics = evaluate(model, val_texts, val_labels, classes)
-    print('--- VALIDATION (best-epoch head) ---')
-    for key, value in metrics.items():
-        if key not in ('preds', 'labels'):
-            print(f'  {key}: {value:.4f}')
+    if args.head_sweep:
+        if args.head != 'torch':
+            print(f'NOTE: --head {args.head} is ignored in --head-sweep mode')
+        summaries = []
+        for name, overrides in parse_sweep_heads(args.sweep_heads, args):
+            vargs = copy.deepcopy(args)
+            for key, value in overrides.items():
+                setattr(vargs, key, value)
+            vout = f'{args.out}_{name}'
+            desc = f'head={vargs.head}'
+            if vargs.head == 'lr':
+                desc += f', lr_c={vargs.lr_c}'
+            elif vargs.head == 'mlp':
+                desc += f', mlp_hidden={vargs.mlp_hidden}, mlp_dropout={vargs.mlp_dropout}'
+            print(f'\n===== head sweep: {name} ({desc}) -> {vout} =====')
+            summary = run_head_variant(vargs, out=vout, started=time.time(), **common)
+            summary['variant'] = name
+            summaries.append(summary)
 
-    per_lang = {}
-    for lang in sorted(df_val['lang'].unique()):
-        rows = df_val['lang'] == lang
-        lm = evaluate(model, [t for t, keep in zip(val_texts, rows) if keep],
-                      df_val.loc[rows, 'st_y'].values, classes)
-        per_lang[lang] = {k: round(float(v), 6)
-                          for k, v in lm.items() if k not in ('preds', 'labels')}
-        print(f"  [{lang}] acc {lm['acc']:.4f} | macro_f1 {lm['macro_f1']:.4f}")
+        print('\n===== HEAD SWEEP SUMMARY (val macro-F1) =====')
+        table = pd.DataFrame([{
+            'variant': s['variant'],
+            'head': s['head'],
+            'lr_c': s['lr_c'],
+            'val_macro_f1': round(s['val_macro_f1'], 4),
+            'val_acc': round(s['val_acc'], 4),
+            'best_epoch': s['best_epoch'],
+        } for s in summaries])
+        print(table.to_string(index=False))
+        best = max(summaries, key=lambda s: s['val_macro_f1'])
+        print(f"\nBest: {best['variant']} ({best['val_macro_f1']:.4f}) "
+              '-- differences here are within seed noise; do not over-read.')
+        return
 
-    if not history:
-        history = [{
-            'epoch': 1,
-            'train_loss': '',
-            'val_macro_f1': f"{metrics['macro_f1']:.6f}",
-            'val_acc': f"{metrics['acc']:.6f}",
-        }]
-
-    os.makedirs(args.out, exist_ok=True)
-    model.save_pretrained(args.out)
-    history_path = f'{args.out}_history.csv'
-    with open(history_path, 'w', encoding='utf-8', newline='') as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(history[0].keys()))
-        writer.writeheader()
-        writer.writerows(history)
-
-    write_run_metadata(args, {
-        'model_id': used_backbone,
-        'device': device,
-        'amp': bool(amp),
-        'classes': classes,
-        'label_sets_match': bool(label_sets_ok),
-        'api_check': api_check,
-        'n_classes': n_classes,
-        'train_size': int(len(df_train)),
-        'val_size': int(len(df_val)),
-        'train_label_counts': dist,
-        'val_label_counts': {str(k): int(v) for k, v in df_val['st_y'].value_counts().items()},
-        'best_epoch': best_epoch,
-        'val_metrics': {k: round(float(v), 6)
-                        for k, v in metrics.items() if k not in ('preds', 'labels')},
-        'per_language': per_lang,
-        'token_audit': token_audit,
-    }, f'{args.out}_run.json')
-
-    print(f'\nSaved model -> {args.out} (save_pretrained)')
-    print(f'Wrote history -> {history_path}')
-    print(f'Wrote metadata -> {args.out}_run.json')
+    run_head_variant(args, out=args.out, started=started, **common)
 
     if args.smoke:
         from setfit import SetFitModel
