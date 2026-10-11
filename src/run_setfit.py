@@ -903,6 +903,14 @@ def main():
     dist = {str(k): int(v) for k, v in df_train['st_y'].value_counts().items()}
     print(f'Train: {len(df_train)} | Val: {len(df_val)} | readout classes: {n_classes} '
           f'({classes}) | train label counts: {dist}')
+    print(f'  per-language rows: train {df_train["lang"].value_counts().to_dict()} | '
+          f'val {df_val["lang"].value_counts().to_dict()}')
+    unexpected = sorted(set(df_train['lang'].unique()) - {'EN', 'IT', 'NL'})
+    if unexpected:
+        print(f'  WARNING: training on unexpected language(s) {unexpected}. FA (Farsi) is the '
+              'cross-lingual zero-shot EVAL set - loading its rows here leaks the eval. Pass '
+              '--languages EN IT NL (or drop the *_FA_training.tsv from the data dir) unless '
+              'this is deliberate.')
 
     train_texts = build_texts(df_train, data_mod, args.max_len)
     val_texts = build_texts(df_val, data_mod, args.max_len)
@@ -937,6 +945,15 @@ def main():
         if args.unfreeze_body_layers is not None:
             print(f'  contrastive body: last {args.unfreeze_body_layers} encoder block(s) '
                   f'+ pooling trainable (partial fine-tuning)')
+        est_pairs = args.num_iterations * len(train_texts) * 2
+        est_steps = max(1, est_pairs // args.contrastive_batch_size)
+        print(f'  estimated contrastive steps: {est_steps} '
+              f'({est_pairs} pairs / batch {args.contrastive_batch_size})')
+        if args.contrastive_batch_size >= 32:
+            print('  WARNING: contrastive batch >= 32 -> fewer optimizer steps than the batch-8 '
+                  'default at a FIXED pair count. At a fixed LR that is LESS training: scale '
+                  '--learning-rate with the batch (~linear) or raise --num-iterations to restore '
+                  'the step count.')
         trainer.train_embeddings(train_texts, list(train_labels), args=training_args)
         print('Contrastive phase done.')
 
