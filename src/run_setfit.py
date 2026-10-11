@@ -26,12 +26,15 @@ The modern SetFit v2 API is used:
       - `--head mlp`: same training loop, but the head is a 2-layer MLP
         `Linear(emb, --mlp-hidden) -> GELU -> Dropout(--mlp-dropout) ->
         Linear(hidden, 2)` instead of the single linear probe. A higher-capacity
-        alternative to A/B on the cached embeddings (`--mlp-hidden`,
+        alternative to A/B on the same trained body (`--body-from`; still
         `--mlp-dropout`).
       - `--head lr`: sklearn `LogisticRegression` (single fit; epochs, batch
         size and patience are N/A, tune `--lr-c` / `--lr-max-iter` instead).
   * `--head-only` calls the head phase directly on the pretrained body with NO
     contrastive phase -- the non-contrastive control.
+  * `--body-from <dir>` reuses a body saved by a previous run (save_pretrained
+    `<out>/`) and skips the contrastive phase, so heads can be swapped cheaply
+    on the SAME trained body (one contrastive run, many head A/Bs).
   * `model.save_pretrained(<dir>)` / `SetFitModel.from_pretrained(<dir>)`.
 
 `--label-column` is honoured by `data.load_frame`: it encodes the chosen column
@@ -69,6 +72,7 @@ Usage:
     python src/run_setfit.py --dry-run            # config only, no torch/setfit
     python src/run_setfit.py --head mlp --head-only --out weights/setfit_s40_mlp
     python src/run_setfit.py --head lr --head-only --out weights/setfit_s40_lr
+    python src/run_setfit.py --body-from weights/setfit_s40_seed40 --head mlp --out weights/setfit_s40_mlp
 """
 
 import argparse
@@ -145,6 +149,10 @@ def parse_args(argv=None):
     parser.add_argument('--head-only', action='store_true',
                         help='Skip the contrastive embedding phase; train only the classifier head on frozen '
                              '(pretrained) embeddings -> the non-contrastive control')
+    parser.add_argument('--body-from', default=None,
+                        help='Directory of a body saved by a previous run (save_pretrained <out>/). Reuses the '
+                             'already-trained contrastive body and skips the contrastive phase, so different '
+                             'heads can be A/B-tested cheaply on the SAME body.')
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--seed', type=int, default=None,
@@ -252,13 +260,20 @@ def load_deps():
 def build_sentence_model(args):
     from sentence_transformers import SentenceTransformer, models
 
-    backbone = args.backbone
-    if backbone == BASE_BACKBONE:
+    if args.body_from:
+        # Reuse a body already trained by a previous run (saved by
+        # save_pretrained at <out>/ as a plain SentenceTransformer) so the head
+        # can be A/B-tested WITHOUT paying for the contrastive phase again.
+        st = SentenceTransformer(args.body_from)
+        backbone = args.body_from
+    elif args.backbone == BASE_BACKBONE:
         st = SentenceTransformer(modules=[
             models.Transformer(BASE_BACKBONE),
             models.Pooling(768, pooling_mode='mean'),
         ])
+        backbone = BASE_BACKBONE
     else:
+        backbone = args.backbone
         try:
             st = SentenceTransformer(backbone)
         except Exception as err:
@@ -647,6 +662,7 @@ def write_run_metadata(args, meta_extra: dict, path: str) -> None:
         'val_fraction': args.val_fraction,
         'head': args.head,
         'head_only': args.head_only,
+        'body_from': args.body_from,
         'head_phase_design': 'A_fixed_embeddings',
         'mlp_hidden': args.mlp_hidden if args.head == 'mlp' else None,
         'mlp_dropout': args.mlp_dropout if args.head == 'mlp' else None,
@@ -730,10 +746,10 @@ def main():
     api_check = check_setfit_api(model)
 
     started = time.time()
-    if args.head_only:
-        print('HEAD-ONLY (design A, fixed embeddings): skipping the contrastive phase; '
-              'training the classifier head on deterministic pretrained embeddings '
-              '(body eval(), no dropout, no gradients) -- the non-contrastive control.')
+    if args.head_only or args.body_from:
+        reason = '--head-only' if args.head_only else f'--body-from {args.body_from}'
+        print(f'Skipping the contrastive phase ({reason}): training the classifier head '
+              'on deterministic frozen embeddings (body eval(), no dropout, no gradients).')
     else:
         training_args = make_training_args(args, amp)
         trainer = make_trainer(args, model, training_args)
