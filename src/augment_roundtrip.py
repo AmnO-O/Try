@@ -9,23 +9,24 @@ restricted to the *train* split (same val_fraction/split_seed as train.py),
 so a paraphrase of a held-out video can never leak into training when the
 output is fed via `train.py --train-extras`.
 
-Fields: yt_comment + yt_title + yt_description (the three fields that
-build_context / render_prompt consume). Pivots: IT->EN->IT, NL->EN->NL,
-EN->DE->EN (DE is a neutral high-resource pivot, not a task language).
+Fields: yt_comment by default (--fields all also round-trips yt_title and
+yt_description, gating on the worst-case overlap/ratio/cosine across them).
+Pivots: IT->EN->IT, NL->EN->NL, EN->DE->EN (DE is a neutral high-resource
+pivot, not a task language).
 
 Caveat: round-tripping label=1 rows can smooth away sarcasm/slurs, leaving a
 neutral paraphrase still tagged 'yes' (label noise, not drift). Use
 --qc-label yes and --review-n to eyeball label-1 pairs before trusting a run,
 and/or --min-overlap-yes / --skip-label yes to protect that class.
 
-Needs the NLLB HF license accepted (gated repo; `huggingface-cli login`) and
-`sentencepiece` (NLLB tokenizer).
+Needs `sentencepiece` (NLLB tokenizer) and `transformers`; the NLLB-200
+distilled checkpoint downloads without a gated license.
 
 Usage:
     python src/augment_roundtrip.py --limit 200 --device cpu --dry-run
     python src/augment_roundtrip.py --languages EN IT NL --split-seed 42 \\
-        --min-cosine 0.8 --max-len-ratio 2.0 --keep-emoji --num-beams 4 \\
-        --qc-label yes --review-n 20
+        --fields comment --min-cosine 0.8 --max-len-ratio 2.0 --keep-emoji \\
+        --num-beams 4 --qc-label yes --review-n 20
 """
 
 import argparse
@@ -35,7 +36,14 @@ import random
 import re
 import sys
 
+import pandas as pd
 import torch
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,7 +56,8 @@ DATA_CODES = {'EN': 'eng_Latn', 'IT': 'ita_Latn', 'NL': 'nld_Latn'}
 PIVOT = {'IT': 'EN', 'NL': 'EN', 'EN': 'DE'}
 PIVOT_CODES = {'EN': 'eng_Latn', 'DE': 'deu_Latn'}
 FIELDS = ('yt_comment', 'yt_title', 'yt_description')
-MAX_WORDS = 512  # NLLB caps at 1024 positions; ~1.35 tok/word keeps this safe
+TOKEN_LIMIT = 512    # NLLB input limit, in tokens (not words)
+MAX_SEG_WORDS = 200  # words per translation chunk (~270 tokens, safely under TOKEN_LIMIT)
 QC_CHARS = 500
 REVIEW_COLUMNS = ['StereoQueerEval_id', 'lang', 'stereotype', 'yt_comment',
                   'roundtrip', 'token_overlap', 'len_ratio', 'cosine']
@@ -80,7 +89,10 @@ def batch_translate(tok, mdl, device, src_code, tgt_code, texts, batch_size, max
     with torch.no_grad():
         for i in range(0, len(texts), batch_size):
             enc = tok(texts[i:i + batch_size], return_tensors='pt', padding=True,
-                      truncation=True, max_length=MAX_WORDS).to(device)
+                      truncation=True, max_length=TOKEN_LIMIT).to(device)
+            if enc['input_ids'].shape[1] >= TOKEN_LIMIT:
+                print(f'  warning: an input hit the {TOKEN_LIMIT}-token limit; '
+                      f'increase MAX_SEG_WORDS chunking if this is common')
             cap = min(max_new_tokens,
                       max(min_new_tokens, int(1.6 * enc['input_ids'].shape[1])))
             gen = mdl.generate(**enc, forced_bos_token_id=bos, max_new_tokens=cap,
@@ -107,6 +119,21 @@ def token_overlap(src: str, out: str) -> float:
 def length_ratio(src: str, out: str) -> float:
     a = len(str(src).split())
     return len(str(out).split()) / a if a else 1.0
+
+
+def clean_field(value) -> str:
+    """Normalize a raw TSV cell to a stripped string.
+
+    Missing values (None / NaN / pd.NA) become '' rather than the literal
+    'nan' string that `str(value)` would produce; this keeps NaN comments out
+    of both the translation inputs and the QC evaluation.
+    """
+    try:
+        if pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
 
 
 # Emoji + their modifiers joiners (ZWJ, VS16, skin tones, regional flags). NLLB
@@ -145,12 +172,25 @@ def segment_sentences(text: str):
     return [p for p in parts if p]
 
 
+def chunk_words(text: str, max_words: int = MAX_SEG_WORDS):
+    """Split an over-long segment into word chunks that fit the model.
+
+    Keeps *all* words (unlike slicing), so a field is never silently shortened
+    and then presented as a paraphrase of the whole source.
+    """
+    words = text.split()
+    if len(words) <= max_words:
+        return [text.strip()] if text.strip() else []
+    return [' '.join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
+
+
 def roundtrip(translate, src_code, pivot_code, texts, split_sentences=True):
     """src -> pivot -> src; only non-empty strings are sent to the model.
 
     With split_sentences, each sentence is round-tripped on its own and the
     results are rejoined, which prevents the model from dropping later clauses
     of a long comment (measured: overlap 0.214 -> 0.5 on a 3-clause example).
+    Segments longer than MAX_SEG_WORDS are chunked first so nothing is truncated.
     """
     out = [''] * len(texts)
     flat, per_row = [], [[] for _ in texts]
@@ -159,8 +199,9 @@ def roundtrip(translate, src_code, pivot_code, texts, split_sentences=True):
             continue
         segs = segment_sentences(t) if split_sentences else [t.strip()]
         for s in segs:
-            per_row[i].append(len(flat))
-            flat.append(s)
+            for chunk in chunk_words(s):
+                per_row[i].append(len(flat))
+                flat.append(chunk)
     if not flat:
         return out
     fwd = translate(src_code, pivot_code, flat)
@@ -190,8 +231,11 @@ def parse_args(argv=None):
                         help='Beam width for NLLB decoding (>1 cuts short-input hallucinations '
                              'at ~num_beams x decode cost; 1 = greedy)')
     parser.add_argument('--device', default=None, help='cuda | cuda:0 | cpu (default: auto)')
-    parser.add_argument('--fields', choices=('comment', 'all'), default='all',
-                        help='Round-trip all three fields or yt_comment only')
+    parser.add_argument('--fields', choices=('comment', 'all'), default='comment',
+                        help='Round-trip yt_comment only (default; QC and review focus on the '
+                             'comment) or all three fields. With "all" the keep/drop gate uses '
+                             'the worst overlap/ratio/cosine across the fields, but only the '
+                             'comment is shown in QC/review, so inspect title/description too')
     parser.add_argument('--keep-emoji', action='store_true',
                         help='Re-attach source emoji (dropped by the MT) to each paraphrase; '
                              'keeps the expressive signal and stops emoji loss from deflating '
@@ -216,7 +260,7 @@ def parse_args(argv=None):
                         help='Sentence-embedding model used by the --min-cosine gate')
     parser.add_argument('--max-len-ratio', type=float, default=0.0,
                         help='Drop if round-trip/source token ratio falls outside [1/r, r] '
-                             '(0 = keep all)')
+                             '(0 = keep all; otherwise must be >= 1)')
     parser.add_argument('--skip-label', choices=('yes', 'no'), default=None,
                         help='Do not augment rows carrying this label')
     parser.add_argument('--limit', type=int, default=0, help='Cap rows per language (0 = all)')
@@ -233,7 +277,26 @@ def parse_args(argv=None):
     parser.add_argument('--dry-run', action='store_true',
                         help='Skip NLLB; use a token-dropping stand-in translator to exercise '
                              'the split/QC/write pipeline without the model.')
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if args.max_len_ratio != 0 and args.max_len_ratio < 1:
+        parser.error('--max-len-ratio must be 0 (off) or >= 1 '
+                     '(values in (0, 1) make the [1/r, r] window unsatisfiable)')
+    if args.batch_size <= 0:
+        parser.error('--batch-size must be > 0')
+    if args.limit < 0:
+        parser.error('--limit must be >= 0')
+    if args.review_n < 0 or args.qc_samples < 0:
+        parser.error('--review-n and --qc-samples must be >= 0')
+    if args.max_new_tokens <= 0:
+        parser.error('--max-new-tokens must be > 0')
+    if args.num_beams < 1:
+        parser.error('--num-beams must be >= 1')
+    for name in ('min_token_overlap', 'min_overlap_yes', 'min_cosine'):
+        value = getattr(args, name)
+        if value is not None and not (0.0 <= value <= 1.0):
+            parser.error(f'--{name.replace("_", "-")} must be in [0, 1]')
+    return args
 
 
 def main():
@@ -242,6 +305,13 @@ def main():
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
     df = data_mod.load_frame(languages=args.languages, label_column=args.label_column)
+    labels = df[args.label_column].astype('string').str.strip().str.lower()
+    bad = labels[~labels.isin(('yes', 'no'))]
+    if len(bad):
+        raise SystemExit(
+            f'error: {len(bad)}/{len(df)} rows have a missing or non-binary value in '
+            f'{args.label_column!r} (e.g. {bad.dropna().unique()[:5].tolist() or ["<missing>"]}); '
+            f'expected yes/no. A missing label must not survive into the augmented output.')
     df_train, df_val = data_mod.split_by_video(df, args.val_fraction, args.split_seed)
     print(f'Train {len(df_train)} | val {len(df_val)} (val-fraction {args.val_fraction}, '
           f'split-seed {args.split_seed})')
@@ -291,39 +361,54 @@ def main():
         if args.limit and len(rows) > args.limit:
             rows = rng.sample(rows, args.limit)
 
+        n = len(rows)
+        src_field = {f: [clean_field(r.get(f, '')) for r in rows] for f in fields}
+
         translated = {}
         for field in fields:
-            texts = [' '.join(str(r.get(field, '')).split()[:MAX_WORDS]) for r in rows]
-            out = roundtrip(translate, src_code, pivot_code, texts,
+            out = roundtrip(translate, src_code, pivot_code, src_field[field],
                             split_sentences=not args.no_split_sentences)
             if args.keep_emoji:
-                out = [restore_emoji(s, h) for s, h in zip(texts, out)]
+                out = [restore_emoji(s, h) for s, h in zip(src_field[field], out)]
             translated[field] = out
 
-        cosines = None
+        cos_field = {f: [None] * n for f in fields}
         if cos_model is not None:
-            srcs = [str(r.get('yt_comment', '')) for r in rows]
-            rts = translated['yt_comment']
-            cosines = [None] * len(rows)
-            idx = [i for i in range(len(rows)) if srcs[i].strip() and rts[i].strip()]
-            if idx:
-                ea = cos_model.encode([srcs[i] for i in idx], normalize_embeddings=True)
-                eb = cos_model.encode([rts[i] for i in idx], normalize_embeddings=True)
-                for j, i in enumerate(idx):
-                    cosines[i] = float((ea[j] * eb[j]).sum())
+            for field in fields:
+                idx = [i for i in range(n) if src_field[field][i] and translated[field][i]]
+                if idx:
+                    ea = cos_model.encode([src_field[field][i] for i in idx],
+                                          normalize_embeddings=True)
+                    eb = cos_model.encode([translated[field][i] for i in idx],
+                                          normalize_embeddings=True)
+                    for j, i in enumerate(idx):
+                        cos_field[field][i] = float((ea[j] * eb[j]).sum())
 
         kept, review = [], []
         counts = {'yes': 0, 'no': 0, 'empty': 0, 'overlap': 0, 'cosine': 0, 'ratio': 0}
         for i, r in enumerate(rows):
-            label = str(r.get(args.label_column, '')).strip().lower()
-            src_comment = str(r.get('yt_comment', ''))
+            label = clean_field(r.get(args.label_column, '')).lower()
+            src_comment = src_field['yt_comment'][i]
             hyp_comment = translated['yt_comment'][i]
-            if src_comment.strip() and not hyp_comment.strip():
+            if not src_comment:
                 counts['empty'] += 1
                 continue
-            ov = token_overlap(src_comment, hyp_comment)
-            lr = length_ratio(src_comment, hyp_comment)
-            cos = cosines[i] if cosines is not None else None
+
+            # Gate on the worst case across every augmented field so an empty
+            # or drifted title/description cannot ride along with --fields all.
+            ov, lr, cos = 1.0, 1.0, None
+            for field in fields:
+                src, hyp = src_field[field][i], translated[field][i]
+                if not src:
+                    continue
+                ov = min(ov, token_overlap(src, hyp))
+                fr = length_ratio(src, hyp)
+                if abs(fr - 1) > abs(lr - 1):
+                    lr = fr
+                cf = cos_field[field][i]
+                if cf is not None:
+                    cos = cf if cos is None else min(cos, cf)
+
             if cos is not None:
                 if cos < args.min_cosine:
                     counts['cosine'] += 1
