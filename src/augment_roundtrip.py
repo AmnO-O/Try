@@ -25,13 +25,14 @@ Usage:
     python src/augment_roundtrip.py --limit 200 --device cpu --dry-run
     python src/augment_roundtrip.py --languages EN IT NL --split-seed 42 \\
         --min-token-overlap 0.2 --max-len-ratio 2.0 --min-overlap-yes 0.4 \\
-        --qc-label yes --review-n 20
+        --keep-emoji --qc-label yes --review-n 20
 """
 
 import argparse
 import csv
 import os
 import random
+import re
 import sys
 
 import torch
@@ -99,6 +100,31 @@ def length_ratio(src: str, out: str) -> float:
     return len(str(out).split()) / a if a else 1.0
 
 
+# Emoji + their modifiers joiners (ZWJ, VS16, skin tones, regional flags). NLLB
+# drops these, which both loses signal and deflates token_overlap (each emoji is
+# a whitespace token, so a preserved-meaning row looks eroded). --keep-emoji
+# scrapes them from the source and re-attaches them to the paraphrase.
+EMOJI_RE = re.compile(
+    '['
+    '\U0001F000-\U0001FAFF'  # pictographs, symbols, supplemental, extended
+    '\U00002600-\U000027BF'  # misc symbols + dingbats
+    '\U0001F1E6-\U0001F1FF'  # regional indicators (flags)
+    '\U0001F3FB-\U0001F3FF'  # skin-tone modifiers
+    '\u200d\uFE0E\uFE0F'     # ZWJ, VS15, VS16
+    ']+'
+)
+
+
+def extract_emoji(text: str) -> str:
+    return ''.join(EMOJI_RE.findall(str(text)))
+
+
+def restore_emoji(src: str, out: str) -> str:
+    """Re-attach the source emoji to a paraphrase that lost them."""
+    emojis = extract_emoji(src)
+    return (str(out).rstrip() + ' ' + emojis).strip() if emojis else str(out)
+
+
 def roundtrip(translate, src_code, pivot_code, texts):
     """src -> pivot -> src; only non-empty strings are sent to the model."""
     out = [''] * len(texts)
@@ -128,6 +154,10 @@ def parse_args(argv=None):
     parser.add_argument('--device', default=None, help='cuda | cuda:0 | cpu (default: auto)')
     parser.add_argument('--fields', choices=('comment', 'all'), default='all',
                         help='Round-trip all three fields or yt_comment only')
+    parser.add_argument('--keep-emoji', action='store_true',
+                        help='Re-attach source emoji (dropped by the MT) to each paraphrase; '
+                             'keeps the expressive signal and stops emoji loss from deflating '
+                             'token_overlap')
     parser.add_argument('--min-token-overlap', type=float, default=0.0,
                         help='Drop a row if the round-tripped comment keeps fewer than this '
                              'fraction of the source tokens (0 = keep all)')
@@ -204,7 +234,10 @@ def main():
         translated = {}
         for field in fields:
             texts = [' '.join(str(r.get(field, '')).split()[:MAX_WORDS]) for r in rows]
-            translated[field] = roundtrip(translate, src_code, pivot_code, texts)
+            out = roundtrip(translate, src_code, pivot_code, texts)
+            if args.keep_emoji:
+                out = [restore_emoji(s, h) for s, h in zip(texts, out)]
+            translated[field] = out
 
         kept, review = [], []
         counts = {'yes': 0, 'no': 0, 'empty': 0, 'overlap': 0, 'ratio': 0}
