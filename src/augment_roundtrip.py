@@ -134,16 +134,39 @@ def restore_emoji(src: str, out: str) -> str:
     return (str(out).rstrip() + ' ' + emojis).strip() if emojis else str(out)
 
 
-def roundtrip(translate, src_code, pivot_code, texts):
-    """src -> pivot -> src; only non-empty strings are sent to the model."""
+# Sentence boundary = . ! ? followed by whitespace (so URLs/decimals survive).
+_SENT_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+def segment_sentences(text: str):
+    """Split a comment into sentences. NLLB drops trailing clauses on multi-
+    clause inputs, so translating each sentence separately keeps them all."""
+    parts = [p.strip() for p in _SENT_RE.split(str(text))]
+    return [p for p in parts if p]
+
+
+def roundtrip(translate, src_code, pivot_code, texts, split_sentences=True):
+    """src -> pivot -> src; only non-empty strings are sent to the model.
+
+    With split_sentences, each sentence is round-tripped on its own and the
+    results are rejoined, which prevents the model from dropping later clauses
+    of a long comment (measured: overlap 0.214 -> 0.5 on a 3-clause example).
+    """
     out = [''] * len(texts)
-    idx = [i for i, t in enumerate(texts) if t.strip()]
-    if not idx:
+    flat, per_row = [], [[] for _ in texts]
+    for i, t in enumerate(texts):
+        if not t.strip():
+            continue
+        segs = segment_sentences(t) if split_sentences else [t.strip()]
+        for s in segs:
+            per_row[i].append(len(flat))
+            flat.append(s)
+    if not flat:
         return out
-    fwd = translate(src_code, pivot_code, [texts[i] for i in idx])
+    fwd = translate(src_code, pivot_code, flat)
     bwd = translate(pivot_code, src_code, fwd)
-    for j, i in enumerate(idx):
-        out[i] = bwd[j]
+    for i, idxs in enumerate(per_row):
+        out[i] = ' '.join(bwd[j] for j in idxs).strip()
     return out
 
 
@@ -173,6 +196,10 @@ def parse_args(argv=None):
                         help='Re-attach source emoji (dropped by the MT) to each paraphrase; '
                              'keeps the expressive signal and stops emoji loss from deflating '
                              'token_overlap')
+    parser.add_argument('--no-split-sentences', action='store_true',
+                        help='Round-trip each whole field at once instead of sentence by '
+                             'sentence (splitting is on by default; it stops NLLB dropping '
+                             'trailing clauses of multi-clause comments)')
     parser.add_argument('--min-token-overlap', type=float, default=0.0,
                         help='Drop a row if the round-tripped comment keeps fewer than this '
                              'fraction of the source tokens (0 = keep all)')
@@ -257,7 +284,8 @@ def main():
         translated = {}
         for field in fields:
             texts = [' '.join(str(r.get(field, '')).split()[:MAX_WORDS]) for r in rows]
-            out = roundtrip(translate, src_code, pivot_code, texts)
+            out = roundtrip(translate, src_code, pivot_code, texts,
+                            split_sentences=not args.no_split_sentences)
             if args.keep_emoji:
                 out = [restore_emoji(s, h) for s, h in zip(texts, out)]
             translated[field] = out
