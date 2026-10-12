@@ -60,12 +60,12 @@ def out_name(prefix: str, lang: str) -> str:
 
 
 def batch_translate(tok, mdl, device, src_code, tgt_code, texts, batch_size, max_new_tokens,
-                    num_beams=1):
+                    num_beams=1, min_new_tokens=48):
     """Batched NLLB translate; returns stripped strings aligned with `texts`.
 
     The generation cap is adaptive: a translation is about as long as its
     source, so only ~1.6x the longest input in the batch is allowed (floored at
-    48 tokens, ceiling --max-new-tokens). A fixed 512 cap made every short
+    --min-new-tokens, ceiling --max-new-tokens). A fixed 512 cap made every short
     comment decode 512 tokens, which is the bulk of the CPU wall time.
 
     num_beams>1 switches from greedy to beam search, which cuts the worst
@@ -81,7 +81,8 @@ def batch_translate(tok, mdl, device, src_code, tgt_code, texts, batch_size, max
         for i in range(0, len(texts), batch_size):
             enc = tok(texts[i:i + batch_size], return_tensors='pt', padding=True,
                       truncation=True, max_length=MAX_WORDS).to(device)
-            cap = min(max_new_tokens, max(48, int(1.6 * enc['input_ids'].shape[1])))
+            cap = min(max_new_tokens,
+                      max(min_new_tokens, int(1.6 * enc['input_ids'].shape[1])))
             gen = mdl.generate(**enc, forced_bos_token_id=bos, max_new_tokens=cap,
                                **gen_kwargs)
             out.extend(t.strip() for t in tok.batch_decode(gen, skip_special_tokens=True))
@@ -159,6 +160,9 @@ def parse_args(argv=None):
     parser.add_argument('--max-new-tokens', type=int, default=256,
                         help='Ceiling on generated tokens per field; the effective cap is '
                              '~1.6x the longest input in the batch, never above this')
+    parser.add_argument('--min-new-tokens', type=int, default=128,
+                        help='Floor on the adaptive cap so short comments whose translation '
+                             'expands are not clipped (was a hard-coded 48)')
     parser.add_argument('--num-beams', type=int, default=1,
                         help='Beam width for NLLB decoding (>1 cuts short-input hallucinations '
                              'at ~num_beams x decode cost; 1 = greedy)')
@@ -222,9 +226,17 @@ def main():
             args.model, dtype=torch.float16 if device.type == 'cuda' else torch.float32,
         ).to(device).eval()
 
+        tok = AutoTokenizer.from_pretrained(args.model)
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(
+            args.model, dtype=torch.float16 if device.type == 'cuda' else torch.float32,
+        ).to(device).eval()
+        if mdl.generation_config is not None:
+            mdl.generation_config.max_length = None
+
         def translate(src_code, tgt_code, texts):
             return batch_translate(tok, mdl, device, src_code, tgt_code, texts,
-                                   args.batch_size, args.max_new_tokens, args.num_beams)
+                                   args.batch_size, args.max_new_tokens, args.num_beams,
+                                   args.min_new_tokens)
 
     fields = FIELDS if args.fields == 'all' else ('yt_comment',)
     total_kept = 0
