@@ -25,7 +25,7 @@ Usage:
     python src/augment_roundtrip.py --limit 200 --device cpu --dry-run
     python src/augment_roundtrip.py --languages EN IT NL --split-seed 42 \\
         --min-token-overlap 0.2 --max-len-ratio 2.0 --min-overlap-yes 0.4 \\
-        --keep-emoji --qc-label yes --review-n 20
+        --keep-emoji --num-beams 4 --qc-label yes --review-n 20
 """
 
 import argparse
@@ -59,23 +59,31 @@ def out_name(prefix: str, lang: str) -> str:
     return f'{prefix}_{lang}_to_{lang}_training.tsv'
 
 
-def batch_translate(tok, mdl, device, src_code, tgt_code, texts, batch_size, max_new_tokens):
+def batch_translate(tok, mdl, device, src_code, tgt_code, texts, batch_size, max_new_tokens,
+                    num_beams=1):
     """Batched NLLB translate; returns stripped strings aligned with `texts`.
 
     The generation cap is adaptive: a translation is about as long as its
     source, so only ~1.6x the longest input in the batch is allowed (floored at
     48 tokens, ceiling --max-new-tokens). A fixed 512 cap made every short
     comment decode 512 tokens, which is the bulk of the CPU wall time.
+
+    num_beams>1 switches from greedy to beam search, which cuts the worst
+    short-input hallucinations at ~num_beams x decode cost.
     """
     tok.src_lang = src_code
     bos = tok.convert_tokens_to_ids(tgt_code)
     out = []
+    gen_kwargs = {}
+    if num_beams and num_beams > 1:
+        gen_kwargs = {'num_beams': num_beams, 'early_stopping': True}
     with torch.no_grad():
         for i in range(0, len(texts), batch_size):
             enc = tok(texts[i:i + batch_size], return_tensors='pt', padding=True,
                       truncation=True, max_length=MAX_WORDS).to(device)
             cap = min(max_new_tokens, max(48, int(1.6 * enc['input_ids'].shape[1])))
-            gen = mdl.generate(**enc, forced_bos_token_id=bos, max_new_tokens=cap)
+            gen = mdl.generate(**enc, forced_bos_token_id=bos, max_new_tokens=cap,
+                               **gen_kwargs)
             out.extend(t.strip() for t in tok.batch_decode(gen, skip_special_tokens=True))
     return out
 
@@ -151,6 +159,9 @@ def parse_args(argv=None):
     parser.add_argument('--max-new-tokens', type=int, default=256,
                         help='Ceiling on generated tokens per field; the effective cap is '
                              '~1.6x the longest input in the batch, never above this')
+    parser.add_argument('--num-beams', type=int, default=1,
+                        help='Beam width for NLLB decoding (>1 cuts short-input hallucinations '
+                             'at ~num_beams x decode cost; 1 = greedy)')
     parser.add_argument('--device', default=None, help='cuda | cuda:0 | cpu (default: auto)')
     parser.add_argument('--fields', choices=('comment', 'all'), default='all',
                         help='Round-trip all three fields or yt_comment only')
@@ -213,7 +224,7 @@ def main():
 
         def translate(src_code, tgt_code, texts):
             return batch_translate(tok, mdl, device, src_code, tgt_code, texts,
-                                   args.batch_size, args.max_new_tokens)
+                                   args.batch_size, args.max_new_tokens, args.num_beams)
 
     fields = FIELDS if args.fields == 'all' else ('yt_comment',)
     total_kept = 0
