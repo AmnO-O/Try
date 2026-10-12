@@ -24,8 +24,8 @@ Needs the NLLB HF license accepted (gated repo; `huggingface-cli login`) and
 Usage:
     python src/augment_roundtrip.py --limit 200 --device cpu --dry-run
     python src/augment_roundtrip.py --languages EN IT NL --split-seed 42 \\
-        --min-token-overlap 0.2 --max-len-ratio 2.0 --min-overlap-yes 0.4 \\
-        --keep-emoji --num-beams 4 --qc-label yes --review-n 20
+        --min-cosine 0.8 --max-len-ratio 2.0 --keep-emoji --num-beams 4 \\
+        --qc-label yes --review-n 20
 """
 
 import argparse
@@ -51,7 +51,7 @@ FIELDS = ('yt_comment', 'yt_title', 'yt_description')
 MAX_WORDS = 512  # NLLB caps at 1024 positions; ~1.35 tok/word keeps this safe
 QC_CHARS = 500
 REVIEW_COLUMNS = ['StereoQueerEval_id', 'lang', 'stereotype', 'yt_comment',
-                  'roundtrip', 'token_overlap', 'len_ratio']
+                  'roundtrip', 'token_overlap', 'len_ratio', 'cosine']
 
 
 def out_name(prefix: str, lang: str) -> str:
@@ -206,6 +206,14 @@ def parse_args(argv=None):
     parser.add_argument('--min-overlap-yes', type=float, default=None,
                         help='Override --min-token-overlap for label=yes rows (guards '
                              'against smoothing the stereotype away)')
+    parser.add_argument('--min-cosine', type=float, default=0.0,
+                        help='Semantic gate: drop a row when the embedding cosine between the '
+                             'source comment and its round-trip is below this (0 = off). When '
+                             'set it REPLACES the token-overlap thresholds: keeps synonym / '
+                             'slur-swap paraphrases (low overlap, high cosine) and drops subtle '
+                             'smoothing (high overlap, low cosine)')
+    parser.add_argument('--cosine-model', default='paraphrase-multilingual-MiniLM-L12-v2',
+                        help='Sentence-embedding model used by the --min-cosine gate')
     parser.add_argument('--max-len-ratio', type=float, default=0.0,
                         help='Drop if round-trip/source token ratio falls outside [1/r, r] '
                              '(0 = keep all)')
@@ -252,11 +260,6 @@ def main():
         mdl = AutoModelForSeq2SeqLM.from_pretrained(
             args.model, dtype=torch.float16 if device.type == 'cuda' else torch.float32,
         ).to(device).eval()
-
-        tok = AutoTokenizer.from_pretrained(args.model)
-        mdl = AutoModelForSeq2SeqLM.from_pretrained(
-            args.model, dtype=torch.float16 if device.type == 'cuda' else torch.float32,
-        ).to(device).eval()
         if mdl.generation_config is not None:
             mdl.generation_config.max_length = None
 
@@ -264,6 +267,13 @@ def main():
             return batch_translate(tok, mdl, device, src_code, tgt_code, texts,
                                    args.batch_size, args.max_new_tokens, args.num_beams,
                                    args.min_new_tokens)
+
+    cos_model = None
+    if args.min_cosine > 0:
+        from sentence_transformers import SentenceTransformer
+        cos_model = SentenceTransformer(args.cosine_model, device=str(device))
+        print(f'Semantic gate: cosine >= {args.min_cosine} ({args.cosine_model}); '
+              f'token-overlap thresholds ignored for the keep/drop decision')
 
     fields = FIELDS if args.fields == 'all' else ('yt_comment',)
     total_kept = 0
@@ -290,8 +300,20 @@ def main():
                 out = [restore_emoji(s, h) for s, h in zip(texts, out)]
             translated[field] = out
 
+        cosines = None
+        if cos_model is not None:
+            srcs = [str(r.get('yt_comment', '')) for r in rows]
+            rts = translated['yt_comment']
+            cosines = [None] * len(rows)
+            idx = [i for i in range(len(rows)) if srcs[i].strip() and rts[i].strip()]
+            if idx:
+                ea = cos_model.encode([srcs[i] for i in idx], normalize_embeddings=True)
+                eb = cos_model.encode([rts[i] for i in idx], normalize_embeddings=True)
+                for j, i in enumerate(idx):
+                    cosines[i] = float((ea[j] * eb[j]).sum())
+
         kept, review = [], []
-        counts = {'yes': 0, 'no': 0, 'empty': 0, 'overlap': 0, 'ratio': 0}
+        counts = {'yes': 0, 'no': 0, 'empty': 0, 'overlap': 0, 'cosine': 0, 'ratio': 0}
         for i, r in enumerate(rows):
             label = str(r.get(args.label_column, '')).strip().lower()
             src_comment = str(r.get('yt_comment', ''))
@@ -301,11 +323,17 @@ def main():
                 continue
             ov = token_overlap(src_comment, hyp_comment)
             lr = length_ratio(src_comment, hyp_comment)
-            thr = args.min_overlap_yes if (label == 'yes' and args.min_overlap_yes is not None) \
-                else args.min_token_overlap
-            if ov < thr:
-                counts['overlap'] += 1
-                continue
+            cos = cosines[i] if cosines is not None else None
+            if cos is not None:
+                if cos < args.min_cosine:
+                    counts['cosine'] += 1
+                    continue
+            else:
+                thr = args.min_overlap_yes if (
+                    label == 'yes' and args.min_overlap_yes is not None) else args.min_token_overlap
+                if ov < thr:
+                    counts['overlap'] += 1
+                    continue
             if args.max_len_ratio > 0 and not (1 / args.max_len_ratio <= lr <= args.max_len_ratio):
                 counts['ratio'] += 1
                 continue
@@ -319,17 +347,20 @@ def main():
             review.append({'StereoQueerEval_id': r.get('StereoQueerEval_id', ''), 'lang': lang,
                            'stereotype': label, 'yt_comment': src_comment,
                            'roundtrip': hyp_comment, 'token_overlap': round(ov, 3),
-                           'len_ratio': round(lr, 3)})
+                           'len_ratio': round(lr, 3),
+                           'cosine': round(cos, 3) if cos is not None else ''})
 
         out_path = out_name(args.out_prefix, lang)
         write_tsv(out_path, kept)
         print(f'{lang}->{pivot}->{lang}: kept {len(kept)}/{len(rows)} '
               f'(yes {counts["yes"]} / no {counts["no"]}) | dropped empty {counts["empty"]}, '
-              f'overlap {counts["overlap"]}, ratio {counts["ratio"]} -> {out_path}')
+              f'cosine {counts["cosine"]}, overlap {counts["overlap"]}, ratio {counts["ratio"]} '
+              f'-> {out_path}')
 
         qc = [p for p in review if args.qc_label == 'all' or p['stereotype'] == args.qc_label]
         for p in rng.sample(qc, min(args.qc_samples, len(qc))):
-            print(f'  QC [{p["stereotype"]}] overlap={p["token_overlap"]} len_ratio={p["len_ratio"]}')
+            print(f'  QC [{p["stereotype"]}] overlap={p["token_overlap"]} '
+                  f'cosine={p.get("cosine", "")} len_ratio={p["len_ratio"]}')
             print(f'    src: {p["yt_comment"][:QC_CHARS]}')
             print(f'    rt : {p["roundtrip"][:QC_CHARS]}')
 
