@@ -13,3 +13,5 @@ transformers==5.19.0
 datasets==5.1.0
 evaluate==0.4.6
 scikit-learn==1.9.0
+# NLLB tokenizer for augment_nllb.py / augment_roundtrip.py (gated model)
+sentencepiece
