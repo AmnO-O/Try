@@ -21,20 +21,9 @@ import math
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoModel
 
 DEFAULT_BACKBONE = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
-
-
-def load_encoder_tokenizer(backbone: str):
-    """HF AutoTokenizer/AutoModel for a backbone id.
-
-    Works for sentence-transformers repos too (their root holds the plain
-    transformer weights/config), so the same code path serves MiniLM and mmBERT.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(backbone)
-    encoder = AutoModel.from_pretrained(backbone)
-    return encoder, tokenizer
 
 
 class XAttnBlock(nn.Module):
