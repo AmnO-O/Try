@@ -9,8 +9,8 @@ the TRAIN split only.
 
 Usage:
     python src/train_xattn.py --languages EN IT NL --epochs 10
-    python src/train_xattn.py --backbone jhu-clsp/mmbert-base --heads 4 --layers 2
-    python src/train_xattn.py --unfreeze-layers 2 --head-lr 1e-3 --backbone-lr 2e-5
+    python src/train_xattn.py --backbone jhu-clsp/mmbert-base --heads 4 --layers 3
+    python src/train_xattn.py --unfreeze-layers 2 --head-lr 5e-4 --backbone-lr 2e-5
 """
 
 import argparse
@@ -36,7 +36,6 @@ from config import (
     SPLIT_SEED,
     VAL_FRACTION,
     WEIGHTS_DIR,
-    WEIGHT_DECAY,
 )
 from train import (
     autocast_ctx,
@@ -136,19 +135,18 @@ def parse_args(argv=None):
     parser.add_argument('--backbone', default=model_xattn.DEFAULT_BACKBONE)
     parser.add_argument('--languages', nargs='*', default=None, help='Subset of EN/IT/NL (default: all)')
     parser.add_argument('--label-column', default='stereotype')
-    parser.add_argument('--max-len', type=int, default=128, help='Comment max tokens')
-    parser.add_argument('--video-max-len', type=int, default=192, help='Title+description max tokens')
+    parser.add_argument('--max-len', type=int, default=160, help='Comment max tokens')
+    parser.add_argument('--video-max-len', type=int, default=256, help='Title+description max tokens (all videos fit)')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
     parser.add_argument('--epochs', type=int, default=MAX_EPOCHS)
     parser.add_argument('--patience', type=int, default=PATIENCE)
-    parser.add_argument('--head-lr', type=float, default=1e-3)
+    parser.add_argument('--head-lr', type=float, default=5e-4)
     parser.add_argument('--backbone-lr', type=float, default=2e-5)
-    parser.add_argument('--weight-decay', type=float, default=WEIGHT_DECAY)
-    parser.add_argument('--unfreeze-layers', type=int, default=0,
-                        help='Unfreeze last N encoder blocks (0 = frozen encoder)')
+    parser.add_argument('--weight-decay', type=float, default=0.05)
+    parser.add_argument('--unfreeze-layers', type=int, default=0, help='Unfreeze last N encoder blocks (0 = frozen)')
     parser.add_argument('--heads', type=int, default=4)
-    parser.add_argument('--layers', type=int, default=1, help='Number of cross-attention blocks')
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--layers', type=int, default=2, help='Number of cross-attention blocks')
+    parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--ffn-mult', type=int, default=4)
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)

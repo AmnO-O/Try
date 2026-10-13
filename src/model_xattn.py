@@ -97,8 +97,16 @@ class XAttnClassifier(nn.Module):
             nn.Linear(2 * d, num_classes),
         )
 
-    def encode(self, input_ids, attention_mask):
-        return self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    def encode(self, ids, mask):
+        # A fully frozen encoder runs in eval() and without gradients: its tower
+        # weights cannot change, so its dropout only adds pointless noise and its
+        # activations would be cached anyway. `encoder_trainable` is set by
+        # build_model() (default True keeps a directly-built model trainable).
+        if getattr(self, 'encoder_trainable', True):
+            return self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+        self.encoder.eval()
+        with torch.no_grad():
+            return self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
 
     def forward(self, comment_ids, comment_mask, video_ids, video_mask):
         h_c = self.encode(comment_ids, comment_mask)
@@ -129,6 +137,7 @@ def build_model(backbone: str, unfreeze_layers: int = 0, **kwargs) -> XAttnClass
 
     net = XAttnClassifier(backbone, **kwargs)
     unfreeze_last_n(net.encoder, unfreeze_layers)
+    net.encoder_trainable = any(p.requires_grad for p in net.encoder.parameters())
     return net
 
 
