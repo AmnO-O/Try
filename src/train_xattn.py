@@ -11,6 +11,7 @@ Usage:
     python src/train_xattn.py --languages EN IT NL --epochs 10
     python src/train_xattn.py --backbone jhu-clsp/mmbert-base --heads 4 --layers 3
     python src/train_xattn.py --unfreeze-layers 2 --head-lr 5e-4 --backbone-lr 2e-5
+    python src/train_xattn.py --freeze-epochs 5 --unfreeze-layers 2 --layers 3
 """
 
 import argparse
@@ -143,7 +144,11 @@ def parse_args(argv=None):
     parser.add_argument('--head-lr', type=float, default=1e-3)
     parser.add_argument('--backbone-lr', type=float, default=2e-5)
     parser.add_argument('--weight-decay', type=float, default=0.01)
-    parser.add_argument('--unfreeze-layers', type=int, default=0, help='Unfreeze last N encoder blocks (0 = frozen)')
+    parser.add_argument('--unfreeze-layers', type=int, default=2,
+                        help='Unfreeze last N encoder blocks (0 = frozen; use a large N to unfreeze all)')
+    parser.add_argument('--freeze-epochs', type=int, default=0,
+                        help='Two-phase: keep the encoder frozen for K epoch(s), then unfreeze the '
+                             'last --unfreeze-layers blocks at --backbone-lr (0 = single phase)')
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--layers', type=int, default=3, help='Number of cross-attention blocks')
     parser.add_argument('--dropout', type=float, default=0.1)
@@ -187,19 +192,34 @@ def main():
     for lang, n in sorted(df_train['lang'].value_counts().items()):
         print(f'  train {lang}: {n}')
 
-    from model import load_tokenizer
+    from model import load_tokenizer, unfreeze_last_n
     tokenizer = load_tokenizer(args.backbone)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.sep_token
 
+    # Two-phase: phase 1 keeps the encoder frozen so the cross-attention stack and
+    # head settle against stationary features; phase 2 (epoch freeze_epochs+1)
+    # re-opens the last --unfreeze-layers blocks at the backbone LR.
+    unfreeze_epoch = args.freeze_epochs + 1 if args.freeze_epochs > 0 else None
+    build_unfreeze = 0 if unfreeze_epoch is not None else args.unfreeze_layers
+
     net = model_xattn.build_model(
-        args.backbone, unfreeze_layers=args.unfreeze_layers,
+        args.backbone, unfreeze_layers=build_unfreeze,
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
     ).to(device)
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
     print(f'  d_model {net.d_model} | heads {args.heads} | cross-attn layers {args.layers} | '
           f'trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params')
+    if unfreeze_epoch is not None:
+        if args.unfreeze_layers <= 0:
+            print('  NOTE: --freeze-epochs has no effect with --unfreeze-layers 0')
+        elif unfreeze_epoch > args.epochs:
+            print(f'  WARNING: --freeze-epochs {args.freeze_epochs} >= --epochs {args.epochs}; '
+                  f'phase 2 never starts')
+        else:
+            print(f'  two-phase: encoder frozen for {args.freeze_epochs} epoch(s), then unfreeze '
+                  f'last {args.unfreeze_layers} block(s) at lr {args.backbone_lr}')
 
     train_loader = make_loader(df_train, tokenizer, args.batch_size,
                                args.max_len, args.video_max_len, shuffle_sampler=args.seed)
@@ -222,6 +242,24 @@ def main():
     best_score, epochs_no_improve, history = -1.0, 0, []
 
     for epoch in range(1, args.epochs + 1):
+        if unfreeze_epoch is not None and epoch == unfreeze_epoch and args.unfreeze_layers > 0:
+            unfreeze_last_n(net.encoder, args.unfreeze_layers)
+            net.encoder_trainable = True
+            new_params = [p for p in net.encoder.parameters() if p.requires_grad]
+            if new_params:
+                optimizer.add_param_group({'params': new_params, 'lr': args.backbone_lr})
+            # Phase 1 is a warm-up, not a contest: the patience clock must start
+            # at the unfreeze epoch or early stopping can kill the run before the
+            # fine-tune phase ever gets a chance.
+            epochs_no_improve = 0
+            from model import layer_index_in_name
+            unfrozen = sorted({
+                i for n, p in net.named_parameters()
+                if p.requires_grad and n.startswith('encoder.')
+                for i in [layer_index_in_name(n)] if i is not None
+            })
+            print(f'  [phase 2] epoch {epoch}: unfroze encoder blocks {unfrozen} '
+                  f'({sum(p.numel() for p in new_params)/1e6:.2f}M params now trainable)')
         started = time.time()
         train_loader.sampler.set_epoch(epoch)
         net.train()
