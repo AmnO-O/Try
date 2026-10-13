@@ -12,6 +12,7 @@ Usage:
     python src/train_xattn.py --backbone jhu-clsp/mmbert-base --heads 4 --layers 3
     python src/train_xattn.py --unfreeze-layers 2 --head-lr 5e-4 --backbone-lr 2e-5
     python src/train_xattn.py --freeze-epochs 5 --unfreeze-layers 2 --layers 3
+    python src/train_xattn.py --query-fields comment,title --unfreeze-layers 2 --layers 3
 """
 
 import argparse
@@ -49,16 +50,34 @@ from train import (
 )
 
 
-class PairedDataset(Dataset):
-    """Tokenizes the comment and the video context into two separate sequences."""
+FIELD_COLUMNS = {'comment': 'yt_comment', 'title': 'yt_title', 'description': 'yt_description'}
+# Only the short fields may move into the query stream; description is long
+# (mean 91 tokens, 27% over 128) and would eat the comment budget.
+QUERY_CHOICES = ('comment', 'title')
 
-    def __init__(self, df, tokenizer, comment_max_len: int = 128, video_max_len: int = 192):
+
+class PairedDataset(Dataset):
+    """Tokenizes the comment and the video context into two separate sequences.
+
+    `query_fields` selects which fields make up the query (comment) stream; any
+    field listed there is *removed* from the video (K/V) stream, so the title can
+    be given to the encoder in-sequence instead of (only) through cross-attention.
+    """
+
+    def __init__(self, df, tokenizer, comment_max_len: int = 128, video_max_len: int = 192,
+                 query_fields=('comment',)):
+        query_fields = tuple(query_fields)
         comments, videos = [], []
         for _, row in df.iterrows():
-            comments.append(data_mod.clean_text(row['yt_comment']))
-            title = data_mod.clean_text(row['yt_title'])
-            desc = data_mod.clean_text(row['yt_description'])
-            videos.append(f' {SEP_TOKEN} '.join(f for f in (title, desc) if f))
+            # Query fields keep the order given on the command line, so
+            # '--query-fields comment,title' puts the comment first and a
+            # right-truncated query never drops the labelled text.
+            q = [data_mod.clean_text(row[FIELD_COLUMNS[f]]) for f in query_fields]
+            comments.append(f' {SEP_TOKEN} '.join(t for t in q if t))
+
+            rest = [f for f in ('title', 'description') if f not in query_fields]
+            v = [data_mod.clean_text(row[FIELD_COLUMNS[f]]) for f in rest]
+            videos.append(f' {SEP_TOKEN} '.join(t for t in v if t))
 
         c = tokenizer(comments, truncation=True, max_length=comment_max_len, padding=False)
         v = tokenizer(videos, truncation=True, max_length=video_max_len, padding=False)
@@ -118,8 +137,9 @@ def evaluate(net, loader, device, criterion=None, use_amp: bool = False):
     return metrics_from(out['preds'], out['labels'], out['loss'])
 
 
-def make_loader(df, tokenizer, batch_size, comment_max_len, video_max_len, shuffle_sampler=None):
-    dataset = PairedDataset(df, tokenizer, comment_max_len, video_max_len)
+def make_loader(df, tokenizer, batch_size, comment_max_len, video_max_len, shuffle_sampler=None,
+                query_fields=('comment',)):
+    dataset = PairedDataset(df, tokenizer, comment_max_len, video_max_len, query_fields)
     pad = tokenizer.pad_token_id
     if shuffle_sampler is not None:
         lengths = [len(c) + len(v) for c, v in zip(dataset.comment_ids, dataset.video_ids)]
@@ -138,6 +158,12 @@ def parse_args(argv=None):
     parser.add_argument('--label-column', default='stereotype')
     parser.add_argument('--max-len', type=int, default=160, help='Comment max tokens')
     parser.add_argument('--video-max-len', type=int, default=256, help='Title+description max tokens (all videos fit)')
+    parser.add_argument('--query-fields', default='comment',
+                        help='Comma-separated fields placed in the query/comment stream '
+                             f'(choices: {", ".join(QUERY_CHOICES)}). A listed field is removed from '
+                             'the K/V stream, so "comment,title" moves the title in-sequence and '
+                             'leaves only the description as attention memory. Order is preserved; '
+                             'comment must be included.')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
     parser.add_argument('--epochs', type=int, default=MAX_EPOCHS)
     parser.add_argument('--patience', type=int, default=PATIENCE)
@@ -168,6 +194,13 @@ def parse_args(argv=None):
         args.history = os.path.splitext(args.out)[0] + '_history.csv'
     if args.heads <= 0 or args.layers <= 0:
         parser.error('--heads and --layers must be >= 1')
+    fields = tuple(dict.fromkeys(f.strip().lower() for f in args.query_fields.split(',') if f.strip()))
+    bad = [f for f in fields if f not in QUERY_CHOICES]
+    if bad:
+        parser.error(f'--query-fields must be a subset of {QUERY_CHOICES}; got {bad}')
+    if 'comment' not in fields:
+        parser.error('--query-fields must include comment (it is the labelled text)')
+    args.query_fields = fields
     return args
 
 
@@ -189,6 +222,9 @@ def main():
 
     print(f'Train {len(df_train)} | val {len(df_val)} (val-fraction {args.val_fraction}, '
           f'split-seed {args.split_seed})')
+    video_fields = [f for f in ('title', 'description') if f not in args.query_fields]
+    print(f'  query stream: {" [SEP] ".join(args.query_fields)} | '
+          f'K/V stream: {" [SEP] ".join(video_fields) or "(none)"}')
     for lang, n in sorted(df_train['lang'].value_counts().items()):
         print(f'  train {lang}: {n}')
 
@@ -222,8 +258,10 @@ def main():
                   f'last {args.unfreeze_layers} block(s) at lr {args.backbone_lr}')
 
     train_loader = make_loader(df_train, tokenizer, args.batch_size,
-                               args.max_len, args.video_max_len, shuffle_sampler=args.seed)
-    val_loader = make_loader(df_val, tokenizer, args.batch_size, args.max_len, args.video_max_len)
+                               args.max_len, args.video_max_len, shuffle_sampler=args.seed,
+                               query_fields=args.query_fields)
+    val_loader = make_loader(df_val, tokenizer, args.batch_size, args.max_len, args.video_max_len,
+                             query_fields=args.query_fields)
 
     if args.evaluate_only:
         net.load_state_dict(torch.load(args.out, map_location=device))
@@ -310,7 +348,8 @@ def main():
     print('--- PER LANGUAGE ---')
     for lang in sorted(df_val['lang'].unique()):
         subset = df_val[df_val['lang'] == lang].reset_index(drop=True)
-        loader = make_loader(subset, tokenizer, args.batch_size, args.max_len, args.video_max_len)
+        loader = make_loader(subset, tokenizer, args.batch_size, args.max_len, args.video_max_len,
+                             query_fields=args.query_fields)
         out = collect(net, loader, device, use_amp=use_amp)
         m = metrics_from(out['preds'], out['labels'])
         print(f"  [{lang}] acc {m['acc']:.4f} | macro_f1 {m['macro_f1']:.4f}")
