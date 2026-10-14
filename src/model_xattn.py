@@ -79,12 +79,12 @@ class XAttnBlock(nn.Module):
         self.norm_kv = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, heads, dropout=dropout, batch_first=True)
         self.norm_ffn = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * ffn_mult),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * ffn_mult, d_model),
-        )
+        # Modern-style FFN: GeGLU gate + linear, no dropout between gate and value
+        d_ff = int(d_model * ffn_mult)
+        self.gate = nn.Linear(d_model, d_ff)
+        self.value = nn.Linear(d_model, d_ff)
+        self.ffn_out = nn.Linear(d_ff, d_model)
+        self.ffn_dropout = nn.Dropout(dropout)
 
     def forward(self, h_q, h_kv, kv_pad_mask, return_attn: bool = False):
         """`return_attn=True` also hands back the (B, heads, Lq, Lkv) attention
@@ -99,7 +99,9 @@ class XAttnBlock(nn.Module):
             a, weights = self.attn(self.norm_q(h_q), kv, kv,
                                    key_padding_mask=kv_pad_mask, need_weights=False)
         h_q = h_q + a
-        out = h_q + self.ffn(self.norm_ffn(h_q))
+        y = self.norm_ffn(h_q)
+        y_ffn = self.ffn_out(nn.functional.gelu(self.gate(y)) * self.value(y))
+        out = h_q + self.ffn_dropout(y_ffn)
         return (out, weights) if return_attn else out
 
 
