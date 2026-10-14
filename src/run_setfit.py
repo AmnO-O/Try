@@ -340,10 +340,14 @@ def apply_body_unfreeze(body, n_layers: int) -> int:
     levers that make a 307M backbone fit a larger contrastive batch. Returns the
     number of encoder blocks actually unfrozen.
     """
-    from model import unfreeze_last_n
+    from model import count_encoder_blocks, unfreeze_last_n
 
-    total_blocks = unfreeze_last_n(body, n_layers)
-    n_unfrozen = min(n_layers, total_blocks) if n_layers > 0 else 0
+    # Clamped on purpose here: a contrastive sweep over n_layers should saturate,
+    # not crash, and the message below reports the clamp. Negative values still
+    # raise (via unfreeze_last_n), which is the case a user cannot mean.
+    total_blocks = count_encoder_blocks(body)
+    n_unfrozen = min(n_layers, total_blocks)
+    unfreeze_last_n(body, n_unfrozen)
 
     # Re-enable the trailing pooling module: param-free for mean pooling, but a
     # weighted/attention pooling carries weights that must train with the blocks.

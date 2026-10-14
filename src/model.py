@@ -52,27 +52,85 @@ def layer_index_in_name(name: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
-def unfreeze_last_n(model: nn.Module, n_layers: int) -> int:
-    """Enables gradients for the last n encoder blocks. 0 freezes the backbone.
-
-    Block indices come from parameter names rather than from module paths, so the
-    function keeps working across encoder layouts.
-    """
-    for param in model.parameters():
-        param.requires_grad = False
-
-    if n_layers <= 0:
-        return 0
-
+def block_groups(model: nn.Module) -> dict:
+    """{block index: [parameters]} for the encoder blocks a name search finds."""
     groups = {}
     for name, param in model.named_parameters():
         index = layer_index_in_name(name)
         if index is not None:
             groups.setdefault(index, []).append(param)
+    return groups
+
+
+def count_encoder_blocks(model: nn.Module) -> int:
+    """How many encoder blocks the name-based search finds (0 if none)."""
+    return len(block_groups(model))
+
+
+def unfreeze_last_n(model: nn.Module, n_layers: int) -> int:
+    """Enables gradients for the last n encoder blocks. 0 freezes the backbone.
+
+    Block indices come from parameter names rather than from module paths, so the
+    function keeps working across encoder layouts: BERT-style MiniLM stores them
+    as `encoder.layer.N`, ModernBERT / mmBERT as `layers.N`, and the search finds
+    12 and 22 respectively (measured in `probe_unfreeze.py`).
+
+    Two things about the boundary are deliberate rather than accidental:
+
+    - **The embeddings stay frozen at every n.** They are the largest table and
+      the least useful thing to fine-tune on ~7k rows, and a caller like
+      `run_setfit.py` relies on their output carrying no `requires_grad` (no
+      autograd graph, no stored activations, no AdamW state) to fit a bigger
+      contrastive batch.
+    - **The encoder's output normalisation is unfrozen with the last block, when
+      it is a sibling of the blocks rather than inside the last one.** ModernBERT
+      keeps it as `final_norm`; BERT-style encoders fold the equivalent
+      `layer.N.output.LayerNorm` *into* block N, so "the last n blocks" would
+      otherwise train the top of a BERT tower and leave the top of a ModernBERT
+      tower frozen. That difference is invisible in the parameter count and
+      lands exactly on the backbone comparison this model exists to make, so it
+      is closed here instead of being left to chance.
+
+    `n_layers` is validated against the encoder actually loaded: a negative value
+    or one larger than the block count raises instead of quietly meaning
+    "freeze everything" or "unfreeze everything". Silently reinterpreting the
+    number is how an `--unfreeze-layers 20` experiment on a 12-block backbone
+    becomes a full fine-tune nobody notices.
+    """
+    if n_layers < 0:
+        raise ValueError(f'unfreeze_last_n: n_layers must be >= 0, got {n_layers}')
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    groups = block_groups(model)
+    if n_layers == 0:
+        return len(groups)
+    if not groups:
+        raise ValueError(
+            'unfreeze_last_n: found no encoder blocks to unfreeze. Block indices are '
+            f'parsed from parameter names ({model.__class__.__name__}); none matched '
+            "'.layer.N'/'.layers.N'/'.blocks.N'. Unfreezing would silently do nothing."
+        )
+    if n_layers > len(groups):
+        raise ValueError(
+            f'unfreeze_last_n: asked for the last {n_layers} blocks but only '
+            f'{len(groups)} were found (indices {min(groups)}..{max(groups)}). '
+            'Use a value within that range - a larger one would have silently '
+            'unfrozen the whole backbone.'
+        )
 
     for index in sorted(groups)[-n_layers:]:
         for param in groups[index]:
             param.requires_grad = True
+
+    # The encoder's output normalisation, where the architecture keeps it outside
+    # the block stack (see the docstring). `embeddings.norm`/-`.LayerNorm` are
+    # nested inside `embeddings`, so they are not matched here and stay frozen.
+    for name, module in model.named_modules():
+        if '.' not in name and 'norm' in name.lower():
+            for param in module.parameters(recurse=True):
+                param.requires_grad = True
     return len(groups)
 
 
@@ -184,22 +242,47 @@ class _ProjectionHead(nn.Module):
 
     ModernBERT ships a decoder-free head already (mlm.head). BERT/RoBERTa/
     XLMRoBERTa keep the decoder *inside* lm_head / cls.predictions, so here we
-    rebuild just dense -> act -> layer_norm (RoBERTa also adds a residual) and
-    discard the linear-to-vocab projection.
+    rebuild exactly the pretrained transform - dense -> activation -> LayerNorm -
+    and discard the linear-to-vocab projection.
+
+    "Exactly" is the point. With `readout_init='verbalizer'` the classifier
+    starts as the pretrained decoder rows for the label words, and that only
+    means what it says if the hidden state reaching them is the one the decoder
+    was trained on. This used to take a `residual` flag that added `x` on the
+    hidden path; `RobertaLMHead.forward` is dense -> gelu -> layer_norm with no
+    residual anywhere, so the flag made the "pretrained" head something else.
+    probe_extract_parts.py compares both against the real heads.
     """
 
-    def __init__(self, lm_head: nn.Module, hidden_act: str = 'gelu', residual: bool = False):
+    def __init__(self, dense: nn.Module, layer_norm: nn.Module, hidden_act: str = 'gelu'):
         super().__init__()
-        self.dense = lm_head.dense
+        self.dense = dense
         self.act = _ACTIVATIONS.get(hidden_act, F.gelu)
-        self.layer_norm = lm_head.layer_norm
-        self.residual = residual
+        self.layer_norm = layer_norm
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.dense(x))
-        if self.residual:
-            h = x + h
-        return self.layer_norm(h)
+        return self.layer_norm(self.act(self.dense(x)))
+
+
+def _head_layernorm(container: nn.Module) -> nn.Module:
+    """The LayerNorm of a pretrained prediction head, whatever it is called.
+
+    RoBERTa / XLMRoBERTa name it `layer_norm`; BERT's `BertPredictionHeadTransform`
+    names it `LayerNorm`.
+    """
+    for attribute in ('layer_norm', 'LayerNorm'):
+        module = getattr(container, attribute, None)
+        if isinstance(module, nn.Module):
+            return module
+    raise ValueError(f'{type(container).__name__}: no LayerNorm found on the prediction head.')
+
+
+def _projection_head(container: nn.Module, hidden_act: str) -> _ProjectionHead:
+    """Rebuilds the decoder-free transform from whatever module owns it."""
+    dense = getattr(container, 'dense', None)
+    if not isinstance(dense, nn.Module):
+        raise ValueError(f'{type(container).__name__}: no `dense` projection on the prediction head.')
+    return _ProjectionHead(dense, _head_layernorm(container), hidden_act)
 
 
 def _extract_parts(mlm, model_name: str):
@@ -211,6 +294,13 @@ def _extract_parts(mlm, model_name: str):
     decoder. Both differences are normalised here so load_model only ever deals
     with: an encoder without the head, a size-preserving head, and a (hidden,
     vocab) decoder for the readout init.
+
+    One more difference is normalised because it used to crash:
+    `BertLMPredictionHead` (`mlm.cls.predictions`) is only the *container*; the
+    dense/LayerNorm pair lives one hop down in `.transform`. Passing the
+    container straight to the head rebuild raised
+    `AttributeError: ... has no attribute 'dense'` on every BERT-style
+    checkpoint. See probe_extract_parts.py.
     """
     encoder = (getattr(mlm, 'model', None)
                or getattr(mlm, 'roberta', None)
@@ -225,11 +315,12 @@ def _extract_parts(mlm, model_name: str):
 
     hidden_act = getattr(mlm.config, 'hidden_act', 'gelu')
     if hasattr(mlm, 'head'):
-        head = mlm.head                      # ModernBERT: already decoder-free
+        head = mlm.head                                  # ModernBERT: already decoder-free
     elif hasattr(mlm, 'lm_head'):
-        head = _ProjectionHead(mlm.lm_head, hidden_act, residual=True)   # RoBERTa / XLMRoBERTa
+        head = _projection_head(mlm.lm_head, hidden_act)         # RoBERTa / XLMRoBERTa
     elif hasattr(mlm, 'cls') and hasattr(mlm.cls, 'predictions'):
-        head = _ProjectionHead(mlm.cls.predictions, hidden_act, residual=False)  # BERT
+        predictions = mlm.cls.predictions                # BERT: the container, not the transform
+        head = _projection_head(getattr(predictions, 'transform', predictions), hidden_act)
     else:
         raise ValueError(f'{model_name}: no recognisable prediction head.')
     return encoder, head, decoder

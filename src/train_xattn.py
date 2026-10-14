@@ -295,6 +295,10 @@ def parse_args(argv=None):
     parser.add_argument('--layers', type=int, default=3, help='Number of cross-attention blocks')
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--ffn-mult', type=int, default=4)
+    parser.add_argument('--pool-init-scale', type=float, default=0.02,
+                        help='Std of the attention-pool query at init (default 0.02). The pool '
+                             'starts near mean pooling; raise this to make it start sharper. '
+                             'For the documented ablation change ONLY this, not the FFN.')
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--seed', type=int, default=SPLIT_SEED)
@@ -360,13 +364,14 @@ def main():
         args.backbone, unfreeze_layers=build_unfreeze,
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
         use_pooled_v=args.pooled_v, separate_encoders=not args.shared_encoder,
-        keep_frozen_dropout=args.keep_frozen_dropout,
+        keep_frozen_dropout=args.keep_frozen_dropout, pool_init_scale=args.pool_init_scale,
     ).to(device)
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
     encoders = 'separate' if net.separate_encoders else 'shared'
     print(f'  d_model {net.d_model} | heads {args.heads} | cross-attn layers {args.layers} | '
-          f'encoders {encoders} | head in {"pooled_c+pooled_v" if net.use_pooled_v else "pooled_c only"} | '
+          f'pool-init-scale {args.pool_init_scale:g} | ')
+    print(f'  encoders {encoders} | head in {"pooled_c+pooled_v" if net.use_pooled_v else "pooled_c only"} | '
           f'trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params')
     print(f'  lr: backbone {args.backbone_lr:g} | xattn blocks {args.xattn_lr:g} '
           f'({sum(p.numel() for p in model_xattn.trainable_groups(net)[1])/1e6:.2f}M params) | '

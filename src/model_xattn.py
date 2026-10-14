@@ -29,8 +29,17 @@ two towers cannot fight over shared weights. Both copies start from the same
 pretrained checkpoint and every frozen block stays bit-identical between them, so
 the towers can only diverge in the `unfreeze_last_n` blocks. Set
 `separate_encoders=False` (trainer: `--shared-encoder`) to go back to one shared
-encoder, which halves the parameter count (240.6M -> 122.98M) and makes the video
-K/V cacheable per video.
+encoder, which roughly halves the parameter count.
+
+**Nothing is cached.** `forward()` always runs both towers, so a video that
+appears in several rows is re-encoded on every row, and a shared encoder does not
+change that by itself - a cache also needs the *video* weights to be stationary.
+That holds while the video tower is fully frozen, and at inference once training
+is done; it does not hold across optimizer steps of a trainable video tower,
+where a persistent representation goes stale. Caching is therefore left out
+until the model's own behaviour is established (`src/report_cost.py` measures the
+parameter cost, which does *not* generalise across backbones: 240.6M vs 122.98M
+for MiniLM, but ~614M vs ~307M for mmBERT, before the cross-attention stack).
 """
 
 import math
@@ -108,6 +117,7 @@ class XAttnClassifier(nn.Module):
         use_pooled_v: bool = False,
         separate_encoders: bool = True,
         keep_frozen_dropout: bool = False,
+        pool_init_scale: float = 0.02,
     ):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(backbone)
@@ -130,7 +140,17 @@ class XAttnClassifier(nn.Module):
             XAttnBlock(d, heads, dropout=dropout, ffn_mult=ffn_mult) for _ in range(layers)
         )
         # Learnable attention-pool query over the comment-side outputs.
-        self.pool_query = nn.Parameter(torch.randn(d) * 0.02)
+        #
+        # The 0.02 is a scale choice, not a fitted constant, and it has a visible
+        # consequence: the score is `(h_c @ q) / sqrt(d)`, so with `q` at 0.02 and
+        # a MiniLM hidden state (RMS ~ 1) the scores start in a narrow band around
+        # 0 and the softmax over Lq tokens starts close to uniform, i.e. close to
+        # mean pooling. That is not a bug - the query trains - but it does mean the
+        # *initial* pooling carries almost no token selection, so "the pool learned
+        # something" has to be read relative to that baseline. `pool_init_scale`
+        # exposes it for the controlled ablation: change only this, not the FFN.
+        # `probe_pool_init.py` measures the initial entropy for several scales.
+        self.pool_query = nn.Parameter(torch.randn(d) * pool_init_scale)
         # The head reads the pooled comment. With `use_pooled_v=True` it also
         # gets a mean-pooled video vector appended: a parallel, comment-independent
         # path, i.e. the late-fusion fallback if the cross-attention learns little.
