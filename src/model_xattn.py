@@ -55,7 +55,9 @@ class XAttnBlock(nn.Module):
         )
 
     def forward(self, h_q, h_kv, kv_pad_mask):
-        a, _ = self.attn(self.norm_q(h_q), self.norm_kv(h_kv), self.norm_kv(h_kv),
+        # Normalise the memory once: the same tensor is both K and V.
+        kv = self.norm_kv(h_kv)
+        a, _ = self.attn(self.norm_q(h_q), kv, kv,
                          key_padding_mask=kv_pad_mask, need_weights=False)
         h_q = h_q + a
         return h_q + self.ffn(self.norm_ffn(h_q))
