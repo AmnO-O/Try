@@ -70,13 +70,21 @@ class XAttnBlock(nn.Module):
             nn.Linear(d_model * ffn_mult, d_model),
         )
 
-    def forward(self, h_q, h_kv, kv_pad_mask):
+    def forward(self, h_q, h_kv, kv_pad_mask, return_attn: bool = False):
+        """`return_attn=True` also hands back the (B, heads, Lq, Lkv) attention
+        probabilities. That forces the slow attention path, so only ask for it
+        when the weights are actually wanted (diagnostics, not training)."""
         # Normalise the memory once: the same tensor is both K and V.
         kv = self.norm_kv(h_kv)
-        a, _ = self.attn(self.norm_q(h_q), kv, kv,
-                         key_padding_mask=kv_pad_mask, need_weights=False)
+        if return_attn:
+            a, weights = self.attn(self.norm_q(h_q), kv, kv, key_padding_mask=kv_pad_mask,
+                                   need_weights=True, average_attn_weights=False)
+        else:
+            a, weights = self.attn(self.norm_q(h_q), kv, kv,
+                                   key_padding_mask=kv_pad_mask, need_weights=False)
         h_q = h_q + a
-        return h_q + self.ffn(self.norm_ffn(h_q))
+        out = h_q + self.ffn(self.norm_ffn(h_q))
+        return (out, weights) if return_attn else out
 
 
 class XAttnClassifier(nn.Module):
@@ -144,14 +152,20 @@ class XAttnClassifier(nn.Module):
         with torch.no_grad():
             return enc(input_ids=ids, attention_mask=mask).last_hidden_state
 
-    def forward(self, comment_ids, comment_mask, video_ids, video_mask):
+    def forward(self, comment_ids, comment_mask, video_ids, video_mask,
+                return_attn: bool = False):
         h_c = self.encode(comment_ids, comment_mask, tower='comment')
         h_v = self.encode(video_ids, video_mask, tower='video')
 
         kv_pad = video_mask == 0          # True = ignore this key
         q_pad = comment_mask == 0
+        attn = []
         for block in self.blocks:
-            h_c = block(h_c, h_v, kv_pad)
+            if return_attn:
+                h_c, w = block(h_c, h_v, kv_pad, return_attn=True)
+                attn.append(w)
+            else:
+                h_c = block(h_c, h_v, kv_pad)
 
         # Attention pooling over the (unmasked) comment tokens.
         scores = (h_c @ self.pool_query) / math.sqrt(self.d_model)
@@ -160,6 +174,7 @@ class XAttnClassifier(nn.Module):
         pooled_c = torch.einsum('bl,bl d->bd', weights, h_c)
 
         # Mean-pooled video as a parallel, comment-independent path.
+        pooled_v = None
         if self.use_pooled_v:
             vmask = video_mask.unsqueeze(-1).to(h_v.dtype)
             pooled_v = (h_v * vmask).sum(1) / vmask.sum(1).clamp(min=1.0)
@@ -168,7 +183,15 @@ class XAttnClassifier(nn.Module):
             # Cross-attention is then the *only* channel from the video tower.
             features = pooled_c
 
-        return self.head(features)
+        logits = self.head(features)
+        if not return_attn:
+            return logits
+        # Diagnostics only: hand back the two pooled vectors so a pooled-v
+        # ablation can be done by re-running the head instead of re-encoding.
+        # `attn[l]` is (B, heads, Lq, Lkv) over the video keys and `weights` the
+        # (B, Lq) comment-pooling distribution.
+        return logits, {'attn': attn, 'pool_weights': weights,
+                        'pooled_c': pooled_c, 'pooled_v': pooled_v}
 
 
 def build_model(backbone: str, unfreeze_layers: int = 0, **kwargs) -> XAttnClassifier:
