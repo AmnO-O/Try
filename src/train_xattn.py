@@ -14,7 +14,7 @@ would split it into ordinary subwords, losing the pretrained boundary signal.
 Usage:
     python src/train_xattn.py --languages EN IT NL --epochs 10
     python src/train_xattn.py --backbone jhu-clsp/mmbert-base --heads 4 --layers 3
-    python src/train_xattn.py --unfreeze-layers 2 --head-lr 5e-4 --backbone-lr 2e-5
+    python src/train_xattn.py --unfreeze-layers 2 --head-lr 5e-4 --xattn-lr 2e-4 --backbone-lr 2e-5
     python src/train_xattn.py --freeze-epochs 5 --unfreeze-layers 2 --layers 3
     python src/train_xattn.py --query-fields comment,title --unfreeze-layers 2 --layers 3
     python src/train_xattn.py --query-fields title,comment --keep-kv-title --layers 3
@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -37,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import data as data_mod
 import model_xattn
+from model import eval_frozen_modules
 from config import (
     BATCH_SIZE,
     MAX_EPOCHS,
@@ -149,6 +151,21 @@ def collate_paired(batch, pad_token_id: int):
     return comment_ids, comment_mask, video_ids, video_mask, labels
 
 
+def group_grad_norms(net):
+    """Pre-clip gradient norms for (backbone, blocks, head).
+
+    `nan` for a group with no trainable parameters (e.g. the backbone before a
+    two-phase unfreeze). This is the diagnostic for "is `--xattn-lr` sane":
+    AdamW moves every parameter by roughly its own LR per step, so what matters
+    is the grad norm relative to the group's weight norm, not the absolute one -
+    a block group whose grad norm stays pinned at the clip ceiling means the LR
+    is fighting the data, not learning from it.
+    """
+    groups = model_xattn.trainable_groups(net)
+    return [math.sqrt(sum(float((p.grad ** 2).sum()) for p in g if p.grad is not None))
+            if g else float('nan') for g in groups]
+
+
 @torch.no_grad()
 def collect(net, loader, device, criterion=None, use_amp: bool = False):
     net.eval()
@@ -218,6 +235,17 @@ def parse_args(argv=None):
     parser.add_argument('--epochs', type=int, default=MAX_EPOCHS)
     parser.add_argument('--patience', type=int, default=PATIENCE)
     parser.add_argument('--head-lr', type=float, default=1e-3)
+    parser.add_argument('--keep-frozen-dropout', action='store_true',
+                        help='Leave Dropout firing inside the frozen encoder blocks instead of '
+                             'switching them to eval(). Frozen blocks are deterministic by '
+                             'default; this restores the old behaviour, where the frozen part '
+                             'of the representation is resampled every step.')
+    parser.add_argument('--xattn-lr', type=float, default=1e-4,
+                        help='LR for the cross-attention blocks. They are freshly '
+                             'initialised Transformer layers, so they get their own, '
+                             'much smaller step than --head-lr. Pass --xattn-lr 1e-3 '
+                             'to reproduce the old behaviour, where the blocks were '
+                             'silently trained at --head-lr.')
     parser.add_argument('--backbone-lr', type=float, default=2e-5)
     parser.add_argument('--weight-decay', type=float, default=0.01)
     parser.add_argument('--unfreeze-layers', type=int, default=2,
@@ -294,6 +322,7 @@ def main():
         args.backbone, unfreeze_layers=build_unfreeze,
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
         use_pooled_v=not args.no_pooled_v, separate_encoders=not args.shared_encoder,
+        keep_frozen_dropout=args.keep_frozen_dropout,
     ).to(device)
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
@@ -301,6 +330,11 @@ def main():
     print(f'  d_model {net.d_model} | heads {args.heads} | cross-attn layers {args.layers} | '
           f'encoders {encoders} | head in {"pooled_c+pooled_v" if net.use_pooled_v else "pooled_c only"} | '
           f'trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params')
+    print(f'  lr: backbone {args.backbone_lr:g} | xattn blocks {args.xattn_lr:g} '
+          f'({sum(p.numel() for p in model_xattn.trainable_groups(net)[1])/1e6:.2f}M params) | '
+          f'head {args.head_lr:g}')
+    frozen_drop = 'ON (stochastic)' if args.keep_frozen_dropout else 'off (frozen blocks deterministic)'
+    print(f'  frozen-block dropout: {frozen_drop}')
     if unfreeze_epoch is not None:
         if args.unfreeze_layers <= 0:
             print('  NOTE: --freeze-epochs has no effect with --unfreeze-layers 0')
@@ -323,8 +357,10 @@ def main():
                       f'VALIDATION (loaded {args.out})')
         return
 
-    backbone_params, head_params = model_xattn.trainable_groups(net)
+    backbone_params, block_params, head_params = model_xattn.trainable_groups(net)
     groups = [{'params': head_params, 'lr': args.head_lr}]
+    if block_params:
+        groups.append({'params': block_params, 'lr': args.xattn_lr})
     if backbone_params:
         groups.append({'params': backbone_params, 'lr': args.backbone_lr})
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
@@ -356,7 +392,10 @@ def main():
         started = time.time()
         train_loader.sampler.set_epoch(epoch)
         net.train()
+        if not args.keep_frozen_dropout:
+            eval_frozen_modules(net)
         running_loss, seen = 0.0, 0
+        gnorm_sum, n_steps = np.zeros(3), 0
         for cids, cmask, vids, vmask, label in train_loader:
             optimizer.zero_grad()
             with autocast_ctx(device, use_amp):
@@ -364,6 +403,8 @@ def main():
                 loss = criterion(logits, label.to(device))
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            gnorm_sum += np.array(group_grad_norms(net))
+            n_steps += 1
             nn.utils.clip_grad_norm_([p for p in net.parameters() if p.requires_grad], 1.0)
             scaler.step(optimizer)
             scaler.update()
@@ -371,13 +412,18 @@ def main():
             seen += label.size(0)
 
         train_loss = running_loss / max(len(train_loader), 1)
+        gnorms = gnorm_sum / max(n_steps, 1)
         metrics = evaluate(net, val_loader, device, criterion, use_amp=use_amp)
         history.append({'epoch': epoch, 'train_loss': train_loss,
                         'val_loss': metrics['loss'], 'val_macro_f1': metrics['macro_f1'],
-                        'val_acc': metrics['acc'], 'seconds': round(time.time() - started, 1)})
+                        'val_acc': metrics['acc'], 'seconds': round(time.time() - started, 1),
+                        'gnorm_backbone': round(float(gnorms[0]), 4),
+                        'gnorm_blocks': round(float(gnorms[1]), 4),
+                        'gnorm_head': round(float(gnorms[2]), 4)})
         print(f"Epoch {epoch:>3}/{args.epochs} | train_loss {train_loss:.4f} | "
               f"val_loss {metrics['loss']:.4f} | val_macro_f1 {metrics['macro_f1']:.4f} | "
-              f"val_acc {metrics['acc']:.4f} | {time.time() - started:.0f}s")
+              f"val_acc {metrics['acc']:.4f} | {time.time() - started:.0f}s | "
+              f"gnorm enc {gnorms[0]:.2f} blk {gnorms[1]:.2f} head {gnorms[2]:.2f} (clip 1.0)")
 
         if metrics['macro_f1'] > best_score + 1e-4:
             best_score = metrics['macro_f1']

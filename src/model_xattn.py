@@ -39,6 +39,13 @@ DEFAULT_BACKBONE = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
 # anything that partitions "backbone vs head" must know about both.
 ENCODER_PREFIXES = ('encoder.', 'encoder_v.')
 
+# The cross-attention stack. These are *freshly initialised* Transformer layers
+# trained on top of a pretrained encoder, so they are a third thing: neither
+# backbone (pretrained, wants a tiny step) nor head (a single linear layer,
+# tolerates a large one). `trainable_groups` gives them their own LR for exactly
+# that reason.
+BLOCK_PREFIX = 'blocks.'
+
 
 class XAttnBlock(nn.Module):
     """Pre-LN cross-attention + FFN, one layer.
@@ -85,6 +92,7 @@ class XAttnClassifier(nn.Module):
         ffn_mult: int = 4,
         use_pooled_v: bool = True,
         separate_encoders: bool = True,
+        keep_frozen_dropout: bool = False,
     ):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(backbone)
@@ -93,6 +101,10 @@ class XAttnClassifier(nn.Module):
         # diverge in the blocks that `unfreeze_last_n` re-opens, because every
         # other block stays frozen (and therefore bit-identical) in both copies.
         self.separate_encoders = separate_encoders
+        # False (default): frozen encoder subtrees are switched to eval(), so the
+        # frozen half of the tower is deterministic in training too. True keeps
+        # their Dropout firing, i.e. the old stochastic-regularizer behaviour.
+        self.keep_frozen_dropout = keep_frozen_dropout
         if separate_encoders:
             self.encoder_v = AutoModel.from_pretrained(backbone)
         d = self.encoder.config.hidden_size
@@ -162,24 +174,45 @@ class XAttnClassifier(nn.Module):
 def build_model(backbone: str, unfreeze_layers: int = 0, **kwargs) -> XAttnClassifier:
     """Builds the classifier and freezes the encoder tower(s) except the last
     `unfreeze_layers` blocks (0 = fully frozen; the head always trains)."""
-    from model import unfreeze_last_n
+    from model import eval_frozen_modules, unfreeze_last_n
 
     net = XAttnClassifier(backbone, **kwargs)
     for enc in net.encoders():
         unfreeze_last_n(enc, unfreeze_layers)
     net.encoder_trainable = any(p.requires_grad for enc in net.encoders()
                                 for p in enc.parameters())
+    if not net.keep_frozen_dropout:
+        for enc in net.encoders():
+            eval_frozen_modules(enc)
     return net
 
 
 def trainable_groups(net: XAttnClassifier):
-    """(backbone, head) parameter groups for a two-LR optimizer.
+    """(backbone, blocks, head) parameter groups for a three-LR optimizer.
 
-    Frozen encoder params are excluded so the backbone group is empty (and can
+    Three groups, because the three parts want very different step sizes:
+
+    - **backbone** - a pretrained encoder being fine-tuned, so a small LR
+      (2e-5) is enough and a large one destroys it;
+    - **blocks** - the cross-attention stack: *randomly initialised* Transformer
+      layers that must learn from scratch, so they need a real training LR, but
+      nowhere near the head's: with AdamW the per-step move is ~LR regardless of
+      gradient scale, so a freshly initialised block (weights ~N(0, 0.02)) fed
+      lr 1e-3 moves ~5% of its own weight scale every step;
+    - **head** - `LayerNorm + Linear(d, 2)` plus the pooling query, a handful of
+      parameters that happily take 1e-3.
+
+    The blocks used to be lumped in with the head (anything not under
+    `ENCODER_PREFIXES`), i.e. the whole 5.33M-parameter attention stack was
+    trained at `--head-lr`. Splitting them out is what `--xattn-lr` controls.
+
+    Frozen encoder params are excluded, so the backbone group is empty (and can
     be skipped) when `unfreeze_layers == 0`. With `separate_encoders` both tower
     encoders belong to the backbone group.
     """
     backbone = [p for enc in net.encoders() for p in enc.parameters() if p.requires_grad]
+    blocks = [p for n, p in net.named_parameters()
+              if p.requires_grad and n.startswith(BLOCK_PREFIX)]
     head = [p for n, p in net.named_parameters()
-            if p.requires_grad and not n.startswith(ENCODER_PREFIXES)]
-    return backbone, head
+            if p.requires_grad and not n.startswith(ENCODER_PREFIXES + (BLOCK_PREFIX,))]
+    return backbone, blocks, head

@@ -76,6 +76,35 @@ def unfreeze_last_n(model: nn.Module, n_layers: int) -> int:
     return len(groups)
 
 
+def eval_frozen_modules(module: nn.Module) -> int:
+    """Puts every fully frozen subtree in eval() and returns how many were hit.
+
+    `unfreeze_last_n` only clears `requires_grad`; the frozen blocks stay in
+    `train()` mode, so their Dropout (and attention-prob Dropout) keeps firing.
+    That makes the "frozen" part of the network stochastic - a different
+    representation every step, and a different one again at eval() - which is
+    neither what "frozen" suggests nor what the K/V cache assumption needs.
+    This switches the frozen subtrees to eval() so they are deterministic.
+
+    Only modules that *own* parameters are switched, and only the maximal ones
+    (a frozen layer, not each of its children). A parameterless leaf such as the
+    Dropout *inside* an unfrozen block therefore keeps working.
+    """
+    frozen = {
+        name: sub for name, sub in module.named_modules()
+        if (params := list(sub.parameters(recurse=True)))
+        and not any(p.requires_grad for p in params)
+    }
+    switched = 0
+    for name, sub in frozen.items():
+        parent = name.rsplit('.', 1)[0] if name else None
+        if parent in frozen:                      # an ancestor already covers it
+            continue
+        sub.eval()
+        switched += 1
+    return switched
+
+
 def label_token_ids(tokenizer, words: Sequence[str] = LABEL_CLASSES) -> List[int]:
     """Vocabulary id of each label word, as a single leading-space token.
 

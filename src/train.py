@@ -46,6 +46,7 @@ from config import (
     best_weights_path,
 )
 from model import (
+    eval_frozen_modules,
     label_token_ids,
     load_model,
     load_model_weights,
@@ -96,6 +97,10 @@ def parse_args(argv=None):
     parser.add_argument('--backbone-lr', type=float, default=BACKBONE_LR)
     parser.add_argument('--weight-decay', type=float, default=WEIGHT_DECAY)
     parser.add_argument('--unfreeze-layers', type=int, default=UNFREEZE_LAYERS, help='0 freezes all of mmBERT')
+    parser.add_argument('--keep-frozen-dropout', action='store_true',
+                        help='Leave Dropout firing inside the frozen encoder blocks. By default they '
+                             'are switched to eval() so the frozen backbone is deterministic in '
+                             'training too (the same rule as train_xattn.py).')
     parser.add_argument('--no-mlm-head', action='store_true', help='Skip the pretrained MLM head')
     parser.add_argument('--readout-init', choices=READOUT_INITS, default=READOUT_INIT,
                         help="Initialisation of the 2-way readout: 'random' or 'verbalizer' "
@@ -317,6 +322,11 @@ def main():
         load_model_weights(model, args.from_checkpoint, device=device)
         print(f'  resumed from checkpoint: {args.from_checkpoint}')
 
+    if not args.keep_frozen_dropout:
+        # Same rule as train_xattn.py: frozen encoder blocks go to eval() so the
+        # frozen backbone is deterministic, in training as well as at eval.
+        print(f'  frozen encoder subtrees set to eval(): {eval_frozen_modules(model)}')
+
     if args.evaluate_only:
         load_model_weights(model, args.out, device=device)
         print_metrics(evaluate(model, val_loader, device, use_amp=use_amp),
@@ -339,6 +349,8 @@ def main():
             train_loader = _reload_batch_size(train_loader, epoch_bs, pad_token_id)
         sampler.set_epoch(epoch)
         model.train()
+        if not args.keep_frozen_dropout:
+            eval_frozen_modules(model)
         running_loss = 0.0
         running_correct = 0
         seen = 0
