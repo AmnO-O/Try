@@ -92,6 +92,38 @@ def split_fields(query_fields, keep_kv_title: bool = False):
     return q, v
 
 
+def assert_nonempty_masks(field, masks, texts):
+    """Rejects rows whose tokenised mask is all zeros.
+
+    A BERT/XLM-R tokenizer always emits the special tokens, so every real string -
+    including the empty one - comes back with at least `[CLS]`, `[SEP]` and a mask
+    of at least two ones. This is unreachable for a well-formed corpus, and that is
+    the point: it is a guard against a malformed corpus, a stripped vocabulary, or
+    a tokenizer without special tokens, all of which would otherwise surface as a
+    NaN loss several epochs in with no indication of which row caused it.
+
+    An all-padding row is genuinely undefined downstream, not just unusual:
+    - the comment side feeds `masked_fill(-inf)` into a softmax, which is 0/0 for a
+      row with no finite score;
+    - the video side becomes a `key_padding_mask` that ignores every key, which the
+      training path answers with zeros and the `need_weights=True` diagnostic path
+      answers with NaN.
+
+    Raises at load time with the offending row and its text, so the failure names
+    the row instead of the epoch.
+    """
+    empty = [i for i, mask in enumerate(masks) if not any(mask)]
+    if not empty:
+        return
+    first = empty[0]
+    raise ValueError(
+        f'{len(empty)}/{len(masks)} {field} field(s) tokenised to zero tokens '
+        f'(first: row {first}, text {texts[first]!r}). Every row needs at least one '
+        f'token: an all-padding row has no finite attention score, so its pooling '
+        f'softmax and its cross-attention keys are both undefined.'
+    )
+
+
 class PairedDataset(Dataset):
     """Tokenizes the comment and the video context into two separate sequences.
 
@@ -124,6 +156,10 @@ class PairedDataset(Dataset):
         self.comment_mask = c['attention_mask']
         self.video_ids = v['input_ids']
         self.video_mask = v['attention_mask']
+        # Cheap, once per dataset: fail on a malformed row here rather than let it
+        # become a NaN loss on epoch 3.
+        assert_nonempty_masks('comment', self.comment_mask, comments)
+        assert_nonempty_masks('video', self.video_mask, videos)
         self.labels = df['st_y'].astype(int).tolist()
 
     def __len__(self):

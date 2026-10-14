@@ -204,10 +204,25 @@ class XAttnClassifier(nn.Module):
             else:
                 h_c = block(h_c, h_v, kv_pad)
 
-        # Attention pooling over the (unmasked) comment tokens.
+        # Attention pooling over the comment tokens.
         scores = (h_c @ self.pool_query) / math.sqrt(self.d_model)
+        # `-inf` rather than a large finite number: a finite fill would leave the
+        # padded positions a share of the softmax mass, and the pool would then
+        # quietly weight the encoder's pad-token outputs.
         scores = scores.masked_fill(q_pad, float('-inf'))
+        # A fully padded comment has no finite score at all, and `softmax` of a row
+        # of -inf is 0/0. Two things go wrong, and only the first is obvious: the
+        # forward value is NaN, and softmax's backward multiplies by its own (NaN)
+        # output, so the gradient is NaN too - the loss and every parameter go to
+        # NaN and the run is dead. Clamping *after* the softmax (`nan_to_num`,
+        # `torch.where`) repairs the forward value but not the gradient. So the
+        # row's scores are made finite *before* the softmax, and its weights are
+        # zeroed below: it pools to zeros, "no comment tokens to attend to".
+        # The data layer rejects such rows; this is the belt to its braces.
+        has_token = (~q_pad).any(dim=1, keepdim=True)          # (B, 1)
+        scores = torch.where(has_token, scores, torch.zeros_like(scores))
         weights = torch.softmax(scores, dim=1)
+        weights = weights.masked_fill(q_pad, 0.0)
         pooled_c = torch.einsum('bl,bl d->bd', weights, h_c)
 
         # Mean-pooled video as a parallel, comment-independent path.
