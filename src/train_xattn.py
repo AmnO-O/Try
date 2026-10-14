@@ -13,6 +13,7 @@ Usage:
     python src/train_xattn.py --unfreeze-layers 2 --head-lr 5e-4 --backbone-lr 2e-5
     python src/train_xattn.py --freeze-epochs 5 --unfreeze-layers 2 --layers 3
     python src/train_xattn.py --query-fields comment,title --unfreeze-layers 2 --layers 3
+    python src/train_xattn.py --query-fields title,comment --keep-kv-title --layers 3
 """
 
 import argparse
@@ -56,17 +57,30 @@ FIELD_COLUMNS = {'comment': 'yt_comment', 'title': 'yt_title', 'description': 'y
 QUERY_CHOICES = ('comment', 'title')
 
 
+def split_fields(query_fields, keep_kv_title: bool = False):
+    """Returns (query_fields, video_fields).
+
+    A field placed in the query is normally removed from the K/V stream. With
+    `keep_kv_title` the title stays in *both*, so adding it in-sequence does not
+    also take away its cross-attention / pooled-video channels.
+    """
+    q = tuple(dict.fromkeys(query_fields))
+    v = tuple(f for f in ('title', 'description')
+              if f not in q or (f == 'title' and keep_kv_title))
+    return q, v
+
+
 class PairedDataset(Dataset):
     """Tokenizes the comment and the video context into two separate sequences.
 
-    `query_fields` selects which fields make up the query (comment) stream; any
-    field listed there is *removed* from the video (K/V) stream, so the title can
-    be given to the encoder in-sequence instead of (only) through cross-attention.
+    `query_fields` selects which fields make up the query (comment) stream; a
+    field listed there is *removed* from the video (K/V) stream unless
+    `keep_kv_title` pins the title to both.
     """
 
     def __init__(self, df, tokenizer, comment_max_len: int = 128, video_max_len: int = 192,
-                 query_fields=('comment',)):
-        query_fields = tuple(query_fields)
+                 query_fields=('comment',), keep_kv_title: bool = False):
+        query_fields, video_fields = split_fields(query_fields, keep_kv_title)
         comments, videos = [], []
         for _, row in df.iterrows():
             # Query fields keep the order given on the command line, so
@@ -75,8 +89,7 @@ class PairedDataset(Dataset):
             q = [data_mod.clean_text(row[FIELD_COLUMNS[f]]) for f in query_fields]
             comments.append(f' {SEP_TOKEN} '.join(t for t in q if t))
 
-            rest = [f for f in ('title', 'description') if f not in query_fields]
-            v = [data_mod.clean_text(row[FIELD_COLUMNS[f]]) for f in rest]
+            v = [data_mod.clean_text(row[FIELD_COLUMNS[f]]) for f in video_fields]
             videos.append(f' {SEP_TOKEN} '.join(t for t in v if t))
 
         c = tokenizer(comments, truncation=True, max_length=comment_max_len, padding=False)
@@ -138,8 +151,8 @@ def evaluate(net, loader, device, criterion=None, use_amp: bool = False):
 
 
 def make_loader(df, tokenizer, batch_size, comment_max_len, video_max_len, shuffle_sampler=None,
-                query_fields=('comment',)):
-    dataset = PairedDataset(df, tokenizer, comment_max_len, video_max_len, query_fields)
+                query_fields=('comment',), keep_kv_title: bool = False):
+    dataset = PairedDataset(df, tokenizer, comment_max_len, video_max_len, query_fields, keep_kv_title)
     pad = tokenizer.pad_token_id
     if shuffle_sampler is not None:
         lengths = [len(c) + len(v) for c, v in zip(dataset.comment_ids, dataset.video_ids)]
@@ -164,6 +177,10 @@ def parse_args(argv=None):
                              'the K/V stream, so "comment,title" moves the title in-sequence and '
                              'leaves only the description as attention memory. Order is preserved; '
                              'comment must be included.')
+    parser.add_argument('--keep-kv-title', action='store_true',
+                        help='Keep the title in the K/V stream even when it is also a query field, '
+                             'so the title is added in-sequence without losing its attention and '
+                             'pooled-video channels (a "duplicate title" format).')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
     parser.add_argument('--epochs', type=int, default=MAX_EPOCHS)
     parser.add_argument('--patience', type=int, default=PATIENCE)
@@ -222,8 +239,8 @@ def main():
 
     print(f'Train {len(df_train)} | val {len(df_val)} (val-fraction {args.val_fraction}, '
           f'split-seed {args.split_seed})')
-    video_fields = [f for f in ('title', 'description') if f not in args.query_fields]
-    print(f'  query stream: {" [SEP] ".join(args.query_fields)} | '
+    query_fields, video_fields = split_fields(args.query_fields, args.keep_kv_title)
+    print(f'  query stream: {" [SEP] ".join(query_fields)} | '
           f'K/V stream: {" [SEP] ".join(video_fields) or "(none)"}')
     for lang, n in sorted(df_train['lang'].value_counts().items()):
         print(f'  train {lang}: {n}')
@@ -259,9 +276,9 @@ def main():
 
     train_loader = make_loader(df_train, tokenizer, args.batch_size,
                                args.max_len, args.video_max_len, shuffle_sampler=args.seed,
-                               query_fields=args.query_fields)
+                               query_fields=args.query_fields, keep_kv_title=args.keep_kv_title)
     val_loader = make_loader(df_val, tokenizer, args.batch_size, args.max_len, args.video_max_len,
-                             query_fields=args.query_fields)
+                             query_fields=args.query_fields, keep_kv_title=args.keep_kv_title)
 
     if args.evaluate_only:
         net.load_state_dict(torch.load(args.out, map_location=device))
@@ -349,7 +366,7 @@ def main():
     for lang in sorted(df_val['lang'].unique()):
         subset = df_val[df_val['lang'] == lang].reset_index(drop=True)
         loader = make_loader(subset, tokenizer, args.batch_size, args.max_len, args.video_max_len,
-                             query_fields=args.query_fields)
+                             query_fields=args.query_fields, keep_kv_title=args.keep_kv_title)
         out = collect(net, loader, device, use_amp=use_amp)
         m = metrics_from(out['preds'], out['labels'])
         print(f"  [{lang}] acc {m['acc']:.4f} | macro_f1 {m['macro_f1']:.4f}")
