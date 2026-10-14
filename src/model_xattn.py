@@ -15,11 +15,15 @@ term is a *parallel, comment-independent* path (a late-fusion shortcut that also
 keeps the model honest if the cross-attention learns nothing); `use_pooled_v`
 drops it so the cross-attention becomes the only channel from the video tower.
 
-One encoder can be shared by both towers (default) so the video tower's K/V can
-be cached per video: with many comments per video this is the efficiency win
-over concatenating everything into one sequence. The design is dimension
-agnostic (`d_model` comes from the backbone), so swapping the light MiniLM for
-`jhu-clsp/mmbert-base` is just a different `--backbone`.
+The video tower has its own encoder instance by default (`separate_encoders`), so
+the two text styles - terse/formal title+description vs. informal, often abusive
+comments - can adapt independently in the blocks that training re-opens, and the
+two towers cannot fight over shared weights. Both copies start from the same
+pretrained checkpoint and every frozen block stays bit-identical between them, so
+the towers can only diverge in the `unfreeze_last_n` blocks. Set
+`separate_encoders=False` (trainer: `--shared-encoder`) to go back to one shared
+encoder, which halves the parameter count (240.6M -> 122.98M) and makes the video
+K/V cacheable per video.
 """
 
 import math
@@ -29,6 +33,11 @@ import torch.nn as nn
 from transformers import AutoModel
 
 DEFAULT_BACKBONE = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+
+# Parameter-name prefixes that belong to the encoder towers. With
+# `separate_encoders` the video tower is a second instance named `encoder_v`, so
+# anything that partitions "backbone vs head" must know about both.
+ENCODER_PREFIXES = ('encoder.', 'encoder_v.')
 
 
 class XAttnBlock(nn.Module):
@@ -75,9 +84,17 @@ class XAttnClassifier(nn.Module):
         dropout: float = 0.1,
         ffn_mult: int = 4,
         use_pooled_v: bool = True,
+        separate_encoders: bool = True,
     ):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(backbone)
+        # With separate encoders the video tower gets its own copy of the same
+        # pretrained checkpoint. Both start identical; the two towers can only
+        # diverge in the blocks that `unfreeze_last_n` re-opens, because every
+        # other block stays frozen (and therefore bit-identical) in both copies.
+        self.separate_encoders = separate_encoders
+        if separate_encoders:
+            self.encoder_v = AutoModel.from_pretrained(backbone)
         d = self.encoder.config.hidden_size
         self.d_model = d
         self.use_pooled_v = use_pooled_v
@@ -99,20 +116,25 @@ class XAttnClassifier(nn.Module):
             nn.Linear(head_in, num_classes),
         )
 
-    def encode(self, ids, mask):
+    def encoders(self):
+        """The encoder module(s) actually in use (one shared, or one per tower)."""
+        return [self.encoder, self.encoder_v] if self.separate_encoders else [self.encoder]
+
+    def encode(self, ids, mask, tower: str = 'comment'):
         # A fully frozen encoder runs in eval() and without gradients: its tower
         # weights cannot change, so its dropout only adds pointless noise and its
         # activations would be cached anyway. `encoder_trainable` is set by
         # build_model() (default True keeps a directly-built model trainable).
+        enc = self.encoder_v if (tower == 'video' and self.separate_encoders) else self.encoder
         if getattr(self, 'encoder_trainable', True):
-            return self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
-        self.encoder.eval()
+            return enc(input_ids=ids, attention_mask=mask).last_hidden_state
+        enc.eval()
         with torch.no_grad():
-            return self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+            return enc(input_ids=ids, attention_mask=mask).last_hidden_state
 
     def forward(self, comment_ids, comment_mask, video_ids, video_mask):
-        h_c = self.encode(comment_ids, comment_mask)
-        h_v = self.encode(video_ids, video_mask)
+        h_c = self.encode(comment_ids, comment_mask, tower='comment')
+        h_v = self.encode(video_ids, video_mask, tower='video')
 
         kv_pad = video_mask == 0          # True = ignore this key
         q_pad = comment_mask == 0
@@ -138,13 +160,15 @@ class XAttnClassifier(nn.Module):
 
 
 def build_model(backbone: str, unfreeze_layers: int = 0, **kwargs) -> XAttnClassifier:
-    """Builds the classifier and freezes the shared encoder except the last
+    """Builds the classifier and freezes the encoder tower(s) except the last
     `unfreeze_layers` blocks (0 = fully frozen; the head always trains)."""
     from model import unfreeze_last_n
 
     net = XAttnClassifier(backbone, **kwargs)
-    unfreeze_last_n(net.encoder, unfreeze_layers)
-    net.encoder_trainable = any(p.requires_grad for p in net.encoder.parameters())
+    for enc in net.encoders():
+        unfreeze_last_n(enc, unfreeze_layers)
+    net.encoder_trainable = any(p.requires_grad for enc in net.encoders()
+                                for p in enc.parameters())
     return net
 
 
@@ -152,9 +176,10 @@ def trainable_groups(net: XAttnClassifier):
     """(backbone, head) parameter groups for a two-LR optimizer.
 
     Frozen encoder params are excluded so the backbone group is empty (and can
-    be skipped) when `unfreeze_layers == 0`.
+    be skipped) when `unfreeze_layers == 0`. With `separate_encoders` both tower
+    encoders belong to the backbone group.
     """
-    backbone = [p for p in net.encoder.parameters() if p.requires_grad]
+    backbone = [p for enc in net.encoders() for p in enc.parameters() if p.requires_grad]
     head = [p for n, p in net.named_parameters()
-            if p.requires_grad and not n.startswith('encoder.')]
+            if p.requires_grad and not n.startswith(ENCODER_PREFIXES)]
     return backbone, head

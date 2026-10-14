@@ -19,6 +19,7 @@ Usage:
     python src/train_xattn.py --query-fields comment,title --unfreeze-layers 2 --layers 3
     python src/train_xattn.py --query-fields title,comment --keep-kv-title --layers 3
     python src/train_xattn.py --no-pooled-v --layers 3      # cross-attention only, no late fusion
+    python src/train_xattn.py --shared-encoder --layers 3   # one shared encoder (pre-2026 default)
 """
 
 import argparse
@@ -208,6 +209,11 @@ def parse_args(argv=None):
                         help='Drop the mean-pooled video vector from the head, leaving the '
                              'cross-attention stack as the only path from the video tower '
                              '(ablation: is the cross-attention earning its keep?)')
+    parser.add_argument('--shared-encoder', action='store_true',
+                        help='Share one encoder between the comment and video towers instead of '
+                             'giving each tower its own copy (the default). Halves the parameter '
+                             'count and makes the video K/V cacheable, but the two towers then '
+                             'share weights and their gradients interfere.')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
     parser.add_argument('--epochs', type=int, default=MAX_EPOCHS)
     parser.add_argument('--patience', type=int, default=PATIENCE)
@@ -287,12 +293,13 @@ def main():
     net = model_xattn.build_model(
         args.backbone, unfreeze_layers=build_unfreeze,
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
-        use_pooled_v=not args.no_pooled_v,
+        use_pooled_v=not args.no_pooled_v, separate_encoders=not args.shared_encoder,
     ).to(device)
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
+    encoders = 'separate' if net.separate_encoders else 'shared'
     print(f'  d_model {net.d_model} | heads {args.heads} | cross-attn layers {args.layers} | '
-          f'head in {"pooled_c+pooled_v" if net.use_pooled_v else "pooled_c only"} | '
+          f'encoders {encoders} | head in {"pooled_c+pooled_v" if net.use_pooled_v else "pooled_c only"} | '
           f'trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params')
     if unfreeze_epoch is not None:
         if args.unfreeze_layers <= 0:
@@ -328,9 +335,10 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         if unfreeze_epoch is not None and epoch == unfreeze_epoch and args.unfreeze_layers > 0:
-            unfreeze_last_n(net.encoder, args.unfreeze_layers)
+            for enc in net.encoders():
+                unfreeze_last_n(enc, args.unfreeze_layers)
             net.encoder_trainable = True
-            new_params = [p for p in net.encoder.parameters() if p.requires_grad]
+            new_params = [p for enc in net.encoders() for p in enc.parameters() if p.requires_grad]
             if new_params:
                 optimizer.add_param_group({'params': new_params, 'lr': args.backbone_lr})
             # Phase 1 is a warm-up, not a contest: the patience clock must start
@@ -340,7 +348,7 @@ def main():
             from model import layer_index_in_name
             unfrozen = sorted({
                 i for n, p in net.named_parameters()
-                if p.requires_grad and n.startswith('encoder.')
+                if p.requires_grad and n.startswith(model_xattn.ENCODER_PREFIXES)
                 for i in [layer_index_in_name(n)] if i is not None
             })
             print(f'  [phase 2] epoch {epoch}: unfroze encoder blocks {unfrozen} '
