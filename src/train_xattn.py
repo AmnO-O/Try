@@ -39,7 +39,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import data as data_mod
 import model_xattn
-from model import eval_frozen_modules
 from config import (
     BATCH_SIZE,
     MAX_EPOCHS,
@@ -376,7 +375,6 @@ def main():
         if unfreeze_epoch is not None and epoch == unfreeze_epoch and args.unfreeze_layers > 0:
             for enc in net.encoders():
                 unfreeze_last_n(enc, args.unfreeze_layers)
-            net.encoder_trainable = True
             new_params = [p for enc in net.encoders() for p in enc.parameters() if p.requires_grad]
             if new_params:
                 optimizer.add_param_group({'params': new_params, 'lr': args.backbone_lr})
@@ -394,9 +392,10 @@ def main():
                   f'({sum(p.numel() for p in new_params)/1e6:.2f}M params now trainable)')
         started = time.time()
         train_loader.sampler.set_epoch(epoch)
+        # train() re-applies the frozen-module invariant itself (see
+        # XAttnClassifier.train), so the frozen encoder blocks stay in eval()
+        # even though train() just walked over them.
         net.train()
-        if not args.keep_frozen_dropout:
-            eval_frozen_modules(net)
         running_loss, seen = 0.0, 0
         gnorm_sum, n_steps = np.zeros(3), 0
         for cids, cmask, vids, vmask, label in train_loader:

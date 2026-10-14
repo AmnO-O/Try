@@ -143,6 +143,29 @@ class XAttnClassifier(nn.Module):
             nn.Linear(head_in, num_classes),
         )
 
+    def train(self, mode: bool = True):
+        """`train(True)` also re-applies the frozen-module invariant.
+
+        `nn.Module.train` walks every child, so it re-enables Dropout (and
+        attention-prob Dropout) inside the *frozen* encoder blocks that
+        `eval_frozen_modules` had switched off. A frozen tower then injects a
+        fresh random mask into every step, which is neither what "frozen" means
+        nor what the "frozen blocks stay bit-identical between the two towers"
+        argument for the separate-encoder design needs.
+
+        Doing it here means the invariant holds for every caller. It used to live
+        in the training loop only, so any other entry point - or a loop that
+        forgot the second line - silently got a stochastic frozen tower. Callers
+        that want the old stochastic-regulator behaviour set
+        `keep_frozen_dropout=True`, which turns this off.
+        """
+        super().train(mode)
+        if mode and not self.keep_frozen_dropout:
+            from model import eval_frozen_modules
+            for enc in self.encoders():
+                eval_frozen_modules(enc)
+        return self
+
     def encoders(self):
         """The encoder module(s) actually in use (one shared, or one per tower)."""
         return [self.encoder, self.encoder_v] if self.separate_encoders else [self.encoder]
@@ -150,14 +173,21 @@ class XAttnClassifier(nn.Module):
     def encode(self, ids, mask, tower: str = 'comment'):
         # A fully frozen encoder runs in eval() and without gradients: its tower
         # weights cannot change, so its dropout only adds pointless noise and its
-        # activations would be cached anyway. `encoder_trainable` is set by
-        # build_model() (default True keeps a directly-built model trainable).
+        # activations would be cached anyway.
+        #
+        # Trainability is decided per encoder rather than from one model-wide
+        # flag. A shared flag is wrong as soon as only one tower is re-opened,
+        # and - worse - it was what made `keep_frozen_dropout` a silent no-op in
+        # the fully frozen case: that branch called enc.eval() unconditionally,
+        # so asking to keep frozen dropout had no effect at all.
         enc = self.encoder_v if (tower == 'video' and self.separate_encoders) else self.encoder
-        if getattr(self, 'encoder_trainable', True):
-            return enc(input_ids=ids, attention_mask=mask).last_hidden_state
-        enc.eval()
-        with torch.no_grad():
-            return enc(input_ids=ids, attention_mask=mask).last_hidden_state
+        trainable = any(p.requires_grad for p in enc.parameters())
+        if not trainable and not self.keep_frozen_dropout:
+            enc.eval()
+        if not trainable:
+            with torch.no_grad():
+                return enc(input_ids=ids, attention_mask=mask).last_hidden_state
+        return enc(input_ids=ids, attention_mask=mask).last_hidden_state
 
     def forward(self, comment_ids, comment_mask, video_ids, video_mask,
                 return_attn: bool = False):
@@ -203,17 +233,24 @@ class XAttnClassifier(nn.Module):
 
 def build_model(backbone: str, unfreeze_layers: int = 0, **kwargs) -> XAttnClassifier:
     """Builds the classifier and freezes the encoder tower(s) except the last
-    `unfreeze_layers` blocks (0 = fully frozen; the head always trains)."""
-    from model import eval_frozen_modules, unfreeze_last_n
+    `unfreeze_layers` blocks (0 = fully frozen; the head always trains).
+
+    Returns the model in one consistent state: the trainable parts in train mode,
+    the frozen parts in eval(). `from_pretrained` leaves the encoder in eval()
+    while the freshly created blocks/head are in train(), so without the
+    `net.train()` below the *trainable* encoder blocks would start with dropout
+    off. `train()` is what applies the frozen-module invariant (see
+    `XAttnClassifier.train`), and `keep_frozen_dropout=True` disables it, leaving
+    the previous stochastic-frozen-blocks behaviour.
+
+    Inference callers should still call `net.eval()` explicitly.
+    """
+    from model import unfreeze_last_n
 
     net = XAttnClassifier(backbone, **kwargs)
     for enc in net.encoders():
         unfreeze_last_n(enc, unfreeze_layers)
-    net.encoder_trainable = any(p.requires_grad for enc in net.encoders()
-                                for p in enc.parameters())
-    if not net.keep_frozen_dropout:
-        for enc in net.encoders():
-            eval_frozen_modules(enc)
+    net.train()
     return net
 
 

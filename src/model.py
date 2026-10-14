@@ -89,6 +89,14 @@ def eval_frozen_modules(module: nn.Module) -> int:
     Only modules that *own* parameters are switched, and only the maximal ones
     (a frozen layer, not each of its children). A parameterless leaf such as the
     Dropout *inside* an unfrozen block therefore keeps working.
+
+    Called on a *whole* model - which is what the training loops do after
+    `model.train()` - this also has to handle a subtree that is frozen from the
+    top: if the entire backbone is frozen, `backbone` itself is in `frozen`, and
+    every child of it must be covered by that one entry. Getting the ancestor
+    test wrong there is silent: the call reports 0 switched and leaves a frozen
+    tower in train mode, which is exactly the dropout state this function exists
+    to remove.
     """
     frozen = {
         name: sub for name, sub in module.named_modules()
@@ -97,8 +105,11 @@ def eval_frozen_modules(module: nn.Module) -> int:
     }
     switched = 0
     for name, sub in frozen.items():
-        parent = name.rsplit('.', 1)[0] if name else None
-        if parent in frozen:                      # an ancestor already covers it
+        # A top-level name ('encoder', 'embeddings') has no ancestor to defer to;
+        # `rsplit` would hand back the name itself, so guard on the dot rather
+        # than on truthiness of the name.
+        parent = name.rsplit('.', 1)[0] if '.' in name else None
+        if parent is not None and parent in frozen:   # an ancestor already covers it
             continue
         sub.eval()
         switched += 1
