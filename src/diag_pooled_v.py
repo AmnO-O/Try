@@ -313,7 +313,8 @@ def main():
     ablation = {}
     print('\n--- B. inference-time pooled_v ablation (head re-run only, no re-encoding) ---')
     if not arch['use_pooled_v']:
-        print('  n/a: this checkpoint has no pooled_v in the head (trained with --no-pooled-v).')
+        print('  n/a: this checkpoint has no pooled_v in the head (the default since the '
+              'flip; i.e. trained without --pooled-v).')
         print('  Compare its section C/D against a with-pooled_v checkpoint instead.')
     else:
         pc = torch.from_numpy(res['pooled_c'])

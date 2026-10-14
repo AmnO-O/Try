@@ -18,8 +18,9 @@ Usage:
     python src/train_xattn.py --freeze-epochs 5 --unfreeze-layers 2 --layers 3
     python src/train_xattn.py --query-fields comment,title --unfreeze-layers 2 --layers 3
     python src/train_xattn.py --query-fields title,comment --keep-kv-title --layers 3
-    python src/train_xattn.py --no-pooled-v --layers 3      # cross-attention only, no late fusion
     python src/train_xattn.py --shared-encoder --layers 3   # one shared encoder (pre-2026 default)
+    python src/train_xattn.py --pooled-v --layers 3         # late fusion: append mean-pooled video
+                                                            # to the head (OFF by default)
 """
 
 import argparse
@@ -222,10 +223,12 @@ def parse_args(argv=None):
                         help='Keep the title in the K/V stream even when it is also a query field, '
                              'so the title is added in-sequence without losing its attention and '
                              'pooled-video channels (a "duplicate title" format).')
-    parser.add_argument('--no-pooled-v', action='store_true',
-                        help='Drop the mean-pooled video vector from the head, leaving the '
-                             'cross-attention stack as the only path from the video tower '
-                             '(ablation: is the cross-attention earning its keep?)')
+    parser.add_argument('--pooled-v', action=argparse.BooleanOptionalAction, default=False,
+                        help='Append a mean-pooled video vector to the head input, i.e. late '
+                             'fusion of the video tower next to the cross-attention. OFF by '
+                             'default: the cross-attention stack is then the only path from the '
+                             '"video" tower. `--no-pooled-v` states the default explicitly. '
+                             'See src/diag_pooled_v.py before quoting any difference.')
     parser.add_argument('--shared-encoder', action='store_true',
                         help='Share one encoder between the comment and video towers instead of '
                              'giving each tower its own copy (the default). Halves the parameter '
@@ -321,7 +324,7 @@ def main():
     net = model_xattn.build_model(
         args.backbone, unfreeze_layers=build_unfreeze,
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
-        use_pooled_v=not args.no_pooled_v, separate_encoders=not args.shared_encoder,
+        use_pooled_v=args.pooled_v, separate_encoders=not args.shared_encoder,
         keep_frozen_dropout=args.keep_frozen_dropout,
     ).to(device)
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)

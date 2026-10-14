@@ -8,12 +8,19 @@ without any generation: pool the comment-side outputs and read a 2-way logit.
 
     comment  -> encoder -> H_c ─┐
                                 ├─ cross-attn (Q=H_c, K=V=H_v) -> attn-pool ─┐
-    video    -> encoder -> H_v ─┘                                mean-pool ──┴─ head
+    video    -> encoder -> H_v ─┘                      (--pooled-v) mean-pool ──┴─ head
 
-The head reads the pooled comment plus a mean-pooled video vector. That second
-term is a *parallel, comment-independent* path (a late-fusion shortcut that also
-keeps the model honest if the cross-attention learns nothing); `use_pooled_v`
-drops it so the cross-attention becomes the only channel from the video tower.
+The head reads the pooled comment. Cross-attention is therefore the *only* channel
+from the video tower, which is the default; `use_pooled_v=True` (CLI `--pooled-v`)
+opts back into late fusion by appending a mean-pooled video vector to the head
+input. That second term is a parallel, comment-independent path - a shortcut that
+reaches the head without being filtered through the comment's own attention, so it
+can also cover for a cross-attention that learns nothing. It is off by default
+because a single run at seed 42 with it removed came out
+`sep_u2_l3 0.7213` vs `sep_u2_l3_npv 0.7396`, and because dropping it removes one
+of the two ways a video-level signal can reach the head; the honest evidence for
+that choice is `src/diag_pooled_v.py` (inference-time ablation + attention
+entropy + probes), not the 1.83pt, which sits inside the run-to-run spread.
 
 The video tower has its own encoder instance by default (`separate_encoders`), so
 the two text styles - terse/formal title+description vs. informal, often abusive
@@ -98,7 +105,7 @@ class XAttnClassifier(nn.Module):
         layers: int = 1,
         dropout: float = 0.1,
         ffn_mult: int = 4,
-        use_pooled_v: bool = True,
+        use_pooled_v: bool = False,
         separate_encoders: bool = True,
         keep_frozen_dropout: bool = False,
     ):
@@ -124,11 +131,11 @@ class XAttnClassifier(nn.Module):
         )
         # Learnable attention-pool query over the comment-side outputs.
         self.pool_query = nn.Parameter(torch.randn(d) * 0.02)
-        # The head reads the pooled comment and, unless `use_pooled_v=False`, a
-        # mean-pooled video vector. `pooled_v` is a parallel, comment-independent
-        # path: the only route by which a video-level signal reaches the head
-        # without being filtered through the comment's own attention (and so the
-        # fallback to plain late fusion if the cross-attention learns nothing).
+        # The head reads the pooled comment. With `use_pooled_v=True` it also
+        # gets a mean-pooled video vector appended: a parallel, comment-independent
+        # path, i.e. the late-fusion fallback if the cross-attention learns little.
+        # Off by default, so cross-attention is the only channel from the video
+        # tower (see the module docstring for why, and for what backs that up).
         head_in = 2 * d if use_pooled_v else d
         self.head = nn.Sequential(
             nn.LayerNorm(head_in),
