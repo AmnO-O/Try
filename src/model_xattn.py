@@ -7,8 +7,13 @@ The comment is the *query* and the video context (title + description) is the
 without any generation: pool the comment-side outputs and read a 2-way logit.
 
     comment  -> encoder -> H_c ─┐
-                                ├─ cross-attn (Q=H_c, K=V=H_v) -> attn-pool -> head
-    video    -> encoder -> H_v ─┘
+                                ├─ cross-attn (Q=H_c, K=V=H_v) -> attn-pool ─┐
+    video    -> encoder -> H_v ─┘                                mean-pool ──┴─ head
+
+The head reads the pooled comment plus a mean-pooled video vector. That second
+term is a *parallel, comment-independent* path (a late-fusion shortcut that also
+keeps the model honest if the cross-attention learns nothing); `use_pooled_v`
+drops it so the cross-attention becomes the only channel from the video tower.
 
 One encoder can be shared by both towers (default) so the video tower's K/V can
 be cached per video: with many comments per video this is the efficiency win
@@ -67,23 +72,29 @@ class XAttnClassifier(nn.Module):
         layers: int = 1,
         dropout: float = 0.1,
         ffn_mult: int = 4,
+        use_pooled_v: bool = True,
     ):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(backbone)
         d = self.encoder.config.hidden_size
         self.d_model = d
+        self.use_pooled_v = use_pooled_v
 
         self.blocks = nn.ModuleList(
             XAttnBlock(d, heads, dropout=dropout, ffn_mult=ffn_mult) for _ in range(layers)
         )
         # Learnable attention-pool query over the comment-side outputs.
         self.pool_query = nn.Parameter(torch.randn(d) * 0.02)
-        # Head reads the pooled comment *and* a mean-pooled video vector, so a
-        # zero-effect cross-attention degrades to a safe late-fusion baseline.
+        # The head reads the pooled comment and, unless `use_pooled_v=False`, a
+        # mean-pooled video vector. `pooled_v` is a parallel, comment-independent
+        # path: the only route by which a video-level signal reaches the head
+        # without being filtered through the comment's own attention (and so the
+        # fallback to plain late fusion if the cross-attention learns nothing).
+        head_in = 2 * d if use_pooled_v else d
         self.head = nn.Sequential(
-            nn.LayerNorm(2 * d),
+            nn.LayerNorm(head_in),
             nn.Dropout(dropout),
-            nn.Linear(2 * d, num_classes),
+            nn.Linear(head_in, num_classes),
         )
 
     def encode(self, ids, mask):
@@ -112,11 +123,16 @@ class XAttnClassifier(nn.Module):
         weights = torch.softmax(scores, dim=1)
         pooled_c = torch.einsum('bl,bl d->bd', weights, h_c)
 
-        # Mean-pooled video as a parallel path.
-        vmask = video_mask.unsqueeze(-1).to(h_v.dtype)
-        pooled_v = (h_v * vmask).sum(1) / vmask.sum(1).clamp(min=1.0)
+        # Mean-pooled video as a parallel, comment-independent path.
+        if self.use_pooled_v:
+            vmask = video_mask.unsqueeze(-1).to(h_v.dtype)
+            pooled_v = (h_v * vmask).sum(1) / vmask.sum(1).clamp(min=1.0)
+            features = torch.cat([pooled_c, pooled_v], dim=-1)
+        else:
+            # Cross-attention is then the *only* channel from the video tower.
+            features = pooled_c
 
-        return self.head(torch.cat([pooled_c, pooled_v], dim=-1))
+        return self.head(features)
 
 
 def build_model(backbone: str, unfreeze_layers: int = 0, **kwargs) -> XAttnClassifier:

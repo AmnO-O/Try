@@ -7,6 +7,10 @@ train.py, so runs are comparable: identical --split-seed / --val-fraction keep
 the same video-level val split, and --train-extras appends augmented files to
 the TRAIN split only.
 
+Fields are joined with the tokenizer's own separator token (XLM-R `</s>`), not
+the literal `[SEP]` text from config: these tokenizers have no `[SEP]` token and
+would split it into ordinary subwords, losing the pretrained boundary signal.
+
 Usage:
     python src/train_xattn.py --languages EN IT NL --epochs 10
     python src/train_xattn.py --backbone jhu-clsp/mmbert-base --heads 4 --layers 3
@@ -14,6 +18,7 @@ Usage:
     python src/train_xattn.py --freeze-epochs 5 --unfreeze-layers 2 --layers 3
     python src/train_xattn.py --query-fields comment,title --unfreeze-layers 2 --layers 3
     python src/train_xattn.py --query-fields title,comment --keep-kv-title --layers 3
+    python src/train_xattn.py --no-pooled-v --layers 3      # cross-attention only, no late fusion
 """
 
 import argparse
@@ -57,6 +62,20 @@ FIELD_COLUMNS = {'comment': 'yt_comment', 'title': 'yt_title', 'description': 'y
 QUERY_CHOICES = ('comment', 'title')
 
 
+def sep_for(tokenizer) -> str:
+    """The tokenizer's own segment separator, as literal text.
+
+    `config.SEP_TOKEN` is the BERT-style `[SEP]`, which *neither* of our
+    tokenizers has as a special token: XLM-R splits it into four ordinary
+    subwords (`[`, `S`, `EP`, `]`) and mmBERT into three. So joining fields with
+    literal `[SEP]` text hands the pretrained encoder a boundary marker it has
+    never seen, instead of the single separator token it was trained on. The
+    prompt baseline substitutes the real token (data.py:255); the xattn path
+    was not doing so.
+    """
+    return tokenizer.sep_token or tokenizer.eos_token or SEP_TOKEN
+
+
 def split_fields(query_fields, keep_kv_title: bool = False):
     """Returns (query_fields, video_fields).
 
@@ -81,16 +100,20 @@ class PairedDataset(Dataset):
     def __init__(self, df, tokenizer, comment_max_len: int = 128, video_max_len: int = 192,
                  query_fields=('comment',), keep_kv_title: bool = False):
         query_fields, video_fields = split_fields(query_fields, keep_kv_title)
+        # Join with the tokenizer's real separator token, not config.SEP_TOKEN:
+        # a literal "[SEP]" is 3-4 ordinary subwords to these tokenizers, so the
+        # tower boundary the encoder was pretrained to see would be missing.
+        sep = sep_for(tokenizer)
         comments, videos = [], []
         for _, row in df.iterrows():
             # Query fields keep the order given on the command line, so
             # '--query-fields comment,title' puts the comment first and a
             # right-truncated query never drops the labelled text.
             q = [data_mod.clean_text(row[FIELD_COLUMNS[f]]) for f in query_fields]
-            comments.append(f' {SEP_TOKEN} '.join(t for t in q if t))
+            comments.append(f' {sep} '.join(t for t in q if t))
 
             v = [data_mod.clean_text(row[FIELD_COLUMNS[f]]) for f in video_fields]
-            videos.append(f' {SEP_TOKEN} '.join(t for t in v if t))
+            videos.append(f' {sep} '.join(t for t in v if t))
 
         c = tokenizer(comments, truncation=True, max_length=comment_max_len, padding=False)
         v = tokenizer(videos, truncation=True, max_length=video_max_len, padding=False)
@@ -181,6 +204,10 @@ def parse_args(argv=None):
                         help='Keep the title in the K/V stream even when it is also a query field, '
                              'so the title is added in-sequence without losing its attention and '
                              'pooled-video channels (a "duplicate title" format).')
+    parser.add_argument('--no-pooled-v', action='store_true',
+                        help='Drop the mean-pooled video vector from the head, leaving the '
+                             'cross-attention stack as the only path from the video tower '
+                             '(ablation: is the cross-attention earning its keep?)')
     parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
     parser.add_argument('--epochs', type=int, default=MAX_EPOCHS)
     parser.add_argument('--patience', type=int, default=PATIENCE)
@@ -240,8 +267,6 @@ def main():
     print(f'Train {len(df_train)} | val {len(df_val)} (val-fraction {args.val_fraction}, '
           f'split-seed {args.split_seed})')
     query_fields, video_fields = split_fields(args.query_fields, args.keep_kv_title)
-    print(f'  query stream: {" [SEP] ".join(query_fields)} | '
-          f'K/V stream: {" [SEP] ".join(video_fields) or "(none)"}')
     for lang, n in sorted(df_train['lang'].value_counts().items()):
         print(f'  train {lang}: {n}')
 
@@ -249,6 +274,9 @@ def main():
     tokenizer = load_tokenizer(args.backbone)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.sep_token
+    sep = sep_for(tokenizer)
+    print(f'  query stream: {f" {sep} ".join(query_fields)} | '
+          f'K/V stream: {f" {sep} ".join(video_fields) or "(none)"}')
 
     # Two-phase: phase 1 keeps the encoder frozen so the cross-attention stack and
     # head settle against stationary features; phase 2 (epoch freeze_epochs+1)
@@ -259,10 +287,12 @@ def main():
     net = model_xattn.build_model(
         args.backbone, unfreeze_layers=build_unfreeze,
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
+        use_pooled_v=not args.no_pooled_v,
     ).to(device)
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
     print(f'  d_model {net.d_model} | heads {args.heads} | cross-attn layers {args.layers} | '
+          f'head in {"pooled_c+pooled_v" if net.use_pooled_v else "pooled_c only"} | '
           f'trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params')
     if unfreeze_epoch is not None:
         if args.unfreeze_layers <= 0:
