@@ -20,6 +20,27 @@ Usage:
     python src/train_xattn.py --shared-encoder --layers 3   # one shared encoder (pre-2026 default)
     python src/train_xattn.py --pooled-v --layers 3         # late fusion: append mean-pooled video
                                                             # to the head (OFF by default)
+
+Candidate recipe (UNVERIFIED bundle - not a measured result). The 3-seed
+architecture screen found nothing separating separate vs shared encoders, and it
+never ran --layers 1, so treat the flags below as a starting point to screen, not
+as a known-good configuration:
+    python src/train_xattn.py \\
+        --shared-encoder \\
+        --layers 1 \\
+        --fusion gated \\
+        --warm-start \\
+        --query-fields comment,title \\
+        --keep-kv-title \\
+        --dropout 0.2 \\
+        --freeze-epochs 2 \\
+        --unfreeze-layers 1 \\
+        --backbone-lr 2e-5 \\
+        --xattn-lr 1e-4 \\
+        --head-lr 1e-3 \\
+        --loss-weight balanced \\
+        --epochs 20 \\
+        --patience 5
 """
 
 import argparse
@@ -312,6 +333,13 @@ def parse_args(argv=None):
     parser.add_argument('--evaluate-only', action='store_true')
     parser.add_argument('--train-extras', default=None,
                         help='Comma-separated TSVs appended to the TRAIN split only (val unchanged)')
+    parser.add_argument('--loss-weight', choices=['none', 'balanced'], default='none',
+                        help='Class weighting for CrossEntropyLoss. "none" (default) is '
+                             'vanilla unweighted CE, so the recorded architecture screen '
+                             'stays comparable; "balanced" uses inverse-frequency weights '
+                             'from the train split. The default is deliberately "none": '
+                             'flipping it would silently change what an unflagged run means. '
+                             'Mirrors train.py --loss-weight.')
     args = parser.parse_args(argv)
     if args.history is None:
         args.history = os.path.splitext(args.out)[0] + '_history.csv'
@@ -412,7 +440,18 @@ def main():
     if backbone_params:
         groups.append({'params': backbone_params, 'lr': args.backbone_lr})
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
+    if args.loss_weight == 'balanced':
+        counts = df_train['st_y'].value_counts().sort_index()
+        n_total = len(df_train)
+        weights = torch.tensor(
+            [n_total / (2.0 * counts[c]) for c in sorted(counts.index)],
+            dtype=torch.float, device=device,
+        )
+        print(f'  class weights (balanced): {[f"{w:.4f}" for w in weights.tolist()]} '
+              f'(counts: {counts.to_dict()})')
+        criterion = nn.CrossEntropyLoss(weight=weights)
+    else:
+        criterion = nn.CrossEntropyLoss()
     scaler = make_scaler(use_amp)
 
     best_score, epochs_no_improve, history = -1.0, 0, []

@@ -95,6 +95,11 @@ def parse_args(argv=None):
     parser.add_argument('--head-lr', type=float, default=HEAD_LR)
     parser.add_argument('--backbone-lr', type=float, default=BACKBONE_LR)
     parser.add_argument('--weight-decay', type=float, default=WEIGHT_DECAY)
+    parser.add_argument('--loss-weight', choices=['none', 'balanced'], default='none',
+                        help='Class weighting for CrossEntropyLoss. "none" (default) is '
+                             'vanilla unweighted CE, so the recorded baseline stays '
+                             'comparable; "balanced" uses inverse-frequency weights from '
+                             'the train split. Matches train_xattn.py --loss-weight.')
     parser.add_argument('--unfreeze-layers', type=int, default=UNFREEZE_LAYERS, help='0 freezes all of mmBERT')
     parser.add_argument('--keep-frozen-dropout', action='store_true',
                         help='Leave Dropout firing inside the frozen encoder blocks. By default they '
@@ -333,7 +338,21 @@ def main():
         evaluate_per_language(model, df_val, tokenizer, args, device, use_amp=use_amp)
         return
 
-    criterion = nn.CrossEntropyLoss()
+    if args.loss_weight == 'balanced':
+        # Same rule as train_xattn.py: inverse-frequency weights from the train
+        # split, indexed by class id, so the two methods can be compared on equal
+        # footing (the flag defaults to 'none' on both sides).
+        counts = df_train['st_y'].value_counts().sort_index()
+        n_total = len(df_train)
+        weights = torch.tensor(
+            [n_total / (2.0 * counts[c]) for c in sorted(counts.index)],
+            dtype=torch.float, device=device,
+        )
+        print(f'  class weights (balanced): {[f"{w:.4f}" for w in weights.tolist()]} '
+              f'(counts: {counts.to_dict()})')
+        criterion = nn.CrossEntropyLoss(weight=weights)
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = build_optimizer(model, args.head_lr, args.backbone_lr, args.weight_decay)
     scaler = make_scaler(use_amp)
 
