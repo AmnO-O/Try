@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Train the two-tower + cross-attention classifier (see model_xattn.py).
+"""Train the two-tower encoder-decoder classifier (see model_xattn.py).
 
 Same data pipeline, split, labels, metrics and early-stopping conventions as
 train.py, so runs are comparable: identical --split-seed / --val-fraction keep
@@ -292,7 +292,9 @@ def parse_args(argv=None):
                         help='Two-phase: keep the encoder frozen for K epoch(s), then unfreeze the '
                              'last --unfreeze-layers blocks at --backbone-lr (0 = single phase)')
     parser.add_argument('--heads', type=int, default=4)
-    parser.add_argument('--layers', type=int, default=3, help='Number of cross-attention blocks')
+    parser.add_argument('--layers', type=int, default=3,
+                        help='Number of decoder blocks (self-attn on the comment, then '
+                             'cross-attn into the video)')
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--ffn-mult', type=int, default=4)
     parser.add_argument('--pool-init-scale', type=float, default=0.02,
@@ -354,7 +356,7 @@ def main():
     print(f'  query stream: {f" {sep} ".join(query_fields)} | '
           f'K/V stream: {f" {sep} ".join(video_fields) or "(none)"}')
 
-    # Two-phase: phase 1 keeps the encoder frozen so the cross-attention stack and
+    # Two-phase: phase 1 keeps the encoder frozen so the decoder stack and
     # head settle against stationary features; phase 2 (epoch freeze_epochs+1)
     # re-opens the last --unfreeze-layers blocks at the backbone LR.
     unfreeze_epoch = args.freeze_epochs + 1 if args.freeze_epochs > 0 else None
@@ -369,7 +371,7 @@ def main():
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
     encoders = 'separate' if net.separate_encoders else 'shared'
-    print(f'  d_model {net.d_model} | heads {args.heads} | cross-attn layers {args.layers} | '
+    print(f'  d_model {net.d_model} | heads {args.heads} | decoder layers {args.layers} | '
           f'pool-init-scale {args.pool_init_scale:g} | ')
     print(f'  encoders {encoders} | head in {"pooled_c+pooled_v" if net.use_pooled_v else "pooled_c only"} | '
           f'trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params')

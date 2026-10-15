@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Two-tower + cross-attention classifier for Task A (stereotype yes/no).
+"""Two-tower encoder-decoder classifier for Task A (stereotype yes/no).
 
-The comment is the *query* and the video context (title + description) is the
-*k/v memory*, i.e. exactly the cross-attention of a Transformer decoder, but
-without any generation: pool the comment-side outputs and read a 2-way logit.
+The video context (title + description) is the *encoder memory* and the comment is
+the *decoder input*: each decoder block first refines the comment against itself
+(self-attention, full - not causal), then attends into the video memory
+(cross-attention, Q=comment, K=V=video). No generation: pool the comment-side
+outputs and read a 2-way logit.
 
     comment  -> encoder -> H_c ─┐
-                                ├─ cross-attn (Q=H_c, K=V=H_v) -> attn-pool ─┐
-    video    -> encoder -> H_v ─┘                      (--pooled-v) mean-pool ──┴─ head
+    video    -> encoder -> H_v ─┤
+    Z_0 = H_c  --[ N x DecoderBlock ]-->  Z_N
+        DecoderBlock:  self-attn(Z, Z, Z)  ->  cross-attn(Q=Z, K=V=H_v)  ->  FFN
+    Z_N  -> attn-pool ─┐
+         (--pooled-v) mean-pool(H_v) ──┴─ head
+
+The self-attention is what makes this a decoder rather than a bare cross-attention
+stack: it lets the comment's own tokens interact (coreference, negation scope)
+before they query the video. It is full attention - a causal mask would be wrong
+for a classification head that reads the whole comment.
 
 The head reads the pooled comment. Cross-attention is therefore the *only* channel
 from the video tower, which is the default; `use_pooled_v=True` (CLI `--pooled-v`)
@@ -38,8 +48,9 @@ That holds while the video tower is fully frozen, and at inference once training
 is done; it does not hold across optimizer steps of a trainable video tower,
 where a persistent representation goes stale. Caching is therefore left out
 until the model's own behaviour is established (`src/report_cost.py` measures the
-parameter cost, which does *not* generalise across backbones: 240.6M vs 122.98M
-for MiniLM, but ~614M vs ~307M for mmBERT, before the cross-attention stack).
+parameter cost, which does *not* generalise across backbones: ~242M vs ~125M for
+MiniLM, but ~642M vs ~335M for mmBERT; the two towers alone are ~614M vs ~307M
+for mmBERT, before the decoder stack).
 """
 
 import math
@@ -69,6 +80,9 @@ class XAttnBlock(nn.Module):
     Query comes from the comment tower; key/value come from the video tower.
     `key_padding_mask` marks padded video tokens (True = ignore), which keeps
     padded positions from entering the softmax.
+
+    Kept for backward compatibility and for the comparison in `probe_decoder.py`;
+    the shipped fusion stack is `DecoderBlock`.
     """
 
     def __init__(self, d_model: int, heads: int, dropout: float = 0.1, ffn_mult: int = 4):
@@ -90,7 +104,6 @@ class XAttnBlock(nn.Module):
         """`return_attn=True` also hands back the (B, heads, Lq, Lkv) attention
         probabilities. That forces the slow attention path, so only ask for it
         when the weights are actually wanted (diagnostics, not training)."""
-        # Normalise the memory once: the same tensor is both K and V.
         kv = self.norm_kv(h_kv)
         if return_attn:
             a, weights = self.attn(self.norm_q(h_q), kv, kv, key_padding_mask=kv_pad_mask,
@@ -101,6 +114,76 @@ class XAttnBlock(nn.Module):
         h_q = h_q + a
         out = h_q + self.ffn(self.norm_ffn(h_q))
         return (out, weights) if return_attn else out
+
+
+class DecoderBlock(nn.Module):
+    """Transformer decoder block: self-attn on comment + cross-attn to video.
+
+    - Self-attn: full attention (no causal). Q=K=V = h (comment-side), mask_c
+    - Cross-attn: Q = h1, K=V = H_v (video memory), mask_v
+    - Pre-LN
+    """
+
+    def __init__(self, d_model: int, heads: int, dropout: float = 0.1, ffn_mult: int = 4):
+        super().__init__()
+        if d_model % heads:
+            raise ValueError(f'd_model {d_model} must be divisible by heads {heads}')
+        self.norm_self = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(d_model, heads, dropout=dropout, batch_first=True)
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, heads, dropout=dropout, batch_first=True)
+        self.norm_ffn = nn.LayerNorm(d_model)
+        d_ff = d_model * ffn_mult
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+        )
+
+    def forward(self, h, H_v, mask_c=None, mask_v=None, return_attn: bool = False):
+        # 1) self-attn
+        h_self_in = self.norm_self(h)
+        # A row whose *every* comment token is padding has no valid key at all:
+        # softmax over an all -inf row is NaN, in the forward value and in the
+        # backward pass. The data layer rejects such rows, but the model keeps its
+        # own belt: keep one key alive for those rows so the softmax is finite,
+        # then zero the whole row back out. `torch.where` with a finite branch is
+        # safe for gradients (unlike clamping after a NaN softmax).
+        if mask_c is not None:
+            has_token = (~mask_c).any(dim=1, keepdim=True)      # (B, 1)
+            safe_mask = mask_c
+            empty_rows = ~has_token.squeeze(1)                  # (B,)
+            if bool(empty_rows.any()):
+                safe_mask = mask_c.clone()
+                safe_mask[empty_rows, 0] = False
+            a_s, _ = self.self_attn(h_self_in, h_self_in, h_self_in,
+                                    key_padding_mask=safe_mask,
+                                    need_weights=False)
+            a_s = torch.where(has_token.unsqueeze(-1), a_s, torch.zeros_like(a_s))
+        else:
+            a_s, _ = self.self_attn(h_self_in, h_self_in, h_self_in,
+                                    need_weights=False)
+        h1 = h + a_s
+
+        # 2) cross-attn
+        kv = self.norm_kv(H_v)
+        qn = self.norm_q(h1)
+        if return_attn:
+            a_c, weights = self.cross_attn(qn, kv, kv,
+                                           key_padding_mask=mask_v,
+                                           need_weights=True,
+                                           average_attn_weights=False)
+        else:
+            a_c, weights = self.cross_attn(qn, kv, kv,
+                                           key_padding_mask=mask_v,
+                                           need_weights=False)
+        h2 = h1 + a_c
+
+        # 3) ffn
+        h3 = h2 + self.ffn(self.norm_ffn(h2))
+        return (h3, weights) if return_attn else h3
 
 
 class XAttnClassifier(nn.Module):
@@ -137,7 +220,7 @@ class XAttnClassifier(nn.Module):
         self.use_pooled_v = use_pooled_v
 
         self.blocks = nn.ModuleList(
-            XAttnBlock(d, heads, dropout=dropout, ffn_mult=ffn_mult) for _ in range(layers)
+            DecoderBlock(d, heads, dropout=dropout, ffn_mult=ffn_mult) for _ in range(layers)
         )
         # Learnable attention-pool query over the comment-side outputs.
         #
@@ -219,10 +302,10 @@ class XAttnClassifier(nn.Module):
         attn = []
         for block in self.blocks:
             if return_attn:
-                h_c, w = block(h_c, h_v, kv_pad, return_attn=True)
+                h_c, w = block(h_c, h_v, q_pad, kv_pad, return_attn=True)
                 attn.append(w)
             else:
-                h_c = block(h_c, h_v, kv_pad)
+                h_c = block(h_c, h_v, q_pad, kv_pad)
 
         # Attention pooling over the comment tokens.
         scores = (h_c @ self.pool_query) / math.sqrt(self.d_model)

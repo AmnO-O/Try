@@ -6,7 +6,7 @@ The `model_xattn` docstring used to state one pair of numbers - 240.6M separate,
 122.98M shared - as if they described the architecture. They describe MiniLM, and
 only MiniLM. mmBERT-base is a different order: a 256k vocab and 768 hidden make
 the embedding table alone ~197M, so one ModernBERT tower is ~307M and the
-separate-encoder default is ~614M *before* the cross-attention stack and head.
+separate-encoder default is ~614M *before* the decoder stack and head.
 That is why the reviewer's memory point stands: separate encoders are a
 deliberate experimental variable, not a free lunch.
 
@@ -49,9 +49,9 @@ def count(module: nn.Module) -> int:
 
 
 def stack_counts(d_model: int):
-    """(cross-attn blocks, pool query, head) counts, from the real classes."""
+    """(decoder blocks, pool query, head) counts, from the real classes."""
     with torch.device('meta'):
-        blocks = nn.ModuleList(model_xattn.XAttnBlock(d_model, HEAD, dropout=0.1, ffn_mult=FFN)
+        blocks = nn.ModuleList(model_xattn.DecoderBlock(d_model, HEAD, dropout=0.1, ffn_mult=FFN)
                                for _ in range(LAYERS))
         pool = nn.Parameter(torch.empty(d_model))
         head = nn.Sequential(nn.LayerNorm(d_model), nn.Dropout(0.1), nn.Linear(d_model, 2))
