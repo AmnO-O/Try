@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Mask-targeted classifier on top of any AutoModelForMaskedLM.
 
 Architecture:

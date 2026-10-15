@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Data loading and torch Dataset for Task A (stereotype detection).
 
 Every input is rendered into an MLM prompt that ends in a [MASK] slot, so the
@@ -81,9 +80,12 @@ _INVISIBLE_JUNK = re.compile('[\u200b\u2060\u00ad\ufeff\u200c\u202a-\u202e\u2066
 # by searching for the first one, so the model would read the wrong position.
 _MASK_LIKE = re.compile(r'<\s*mask\s*>|\[\s*mask\s*\]|__mask__', re.IGNORECASE)
 
+# Web URLs (http/https/www) - common in video descriptions and boilerplate noise
+_URL_PATTERN = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
+
 
 def clean_text(text: str) -> str:
-    """Lowercase, flatten newlines and strip invisible junk. Keeps diacritics.
+    """Lowercase, flatten newlines, strip URLs and invisible junk. Keeps diacritics.
 
     Mask markers are removed as well: the [MASK] slot is located by token id, so
     a literal marker inside a comment would be mistaken for the slot.
@@ -92,6 +94,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r'[\n\t\r]+', ' ', text)
     text = _INVISIBLE_JUNK.sub(' ', text)
     text = _MASK_LIKE.sub(' ', text)
+    text = _URL_PATTERN.sub(' ', text)
     return re.sub(r'\s+', ' ', text).strip()
 
 

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """What the model actually costs, per backbone and per encoder setting.
 
 The `model_xattn` docstring used to state one pair of numbers - 240.6M separate,
@@ -27,10 +26,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..'))
 
-from transformers import AutoConfig, AutoModel  # noqa: E402
+from transformers import AutoConfig, AutoModel
 
-import model_xattn  # noqa: E402
-from model import count_encoder_blocks, unfreeze_last_n  # noqa: E402
+import model_xattn
+from model import count_encoder_blocks, unfreeze_last_n
 
 BACKBONES = [
     ('MiniLM-L12', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'),

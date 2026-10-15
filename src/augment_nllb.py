@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Offline translation augmentation with NLLB-200 distilled 1.3B.
 
 Translates comments per (src, tgt) pair driven by --plan. Gold labels

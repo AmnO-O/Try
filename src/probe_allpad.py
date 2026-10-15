@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """All-padding rows: what breaks, in the forward pass *and* the backward pass.
 
 Two claims to check:
@@ -133,9 +132,9 @@ print('         diagnostic path, and neither one is loud.')
 
 print()
 print('=== 3. the data-layer guard ===')
-import pandas as pd  # noqa: E402
-from model import load_tokenizer  # noqa: E402
-from train_xattn import PairedDataset, assert_nonempty_masks  # noqa: E402
+import pandas as pd
+from model import load_tokenizer
+from train_xattn import PairedDataset, assert_nonempty_masks
 
 check(assert_nonempty_masks('comment', [[1, 1], [1], [1, 1, 0]], ['a', 'b', 'c']) is None,
       '3a does not fire on normal masks')
@@ -159,7 +158,7 @@ check(all(any(m) for m in ds.comment_mask) and all(any(m) for m in ds.video_mask
 
 print()
 print('=== 4. end to end: one malformed row inside a real batch ===')
-import model_xattn  # noqa: E402
+import model_xattn
 
 net = model_xattn.build_model(BACKBONE, unfreeze_layers=2, heads=4, layers=1,
                               use_pooled_v=False, separate_encoders=False)
@@ -251,7 +250,7 @@ print('=== 6. the comment fallback is safe on each supported backbone ===')
 # the decoder/pooling guard). The preprocessing guard is the primary defence, but
 # the fallback still runs the encoder on an all-zero mask, so that has to be finite
 # or the fallback would be silently useless. Checked on both supported backbones.
-from transformers import AutoModel, AutoTokenizer  # noqa: E402
+from transformers import AutoModel, AutoTokenizer
 
 for label, backbone in (('MiniLM-L12 (BERT-style)', BACKBONE),
                         ('mmBERT-base (ModernBERT)', 'jhu-clsp/mmBERT-base')):

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Does unfreeze_last_n() do what it says, on both backbones?
 
 `unfreeze_last_n` only clears `requires_grad`; which parameters those are is
@@ -28,16 +27,15 @@ import gc
 import os
 import sys
 
-import torch
 import torch.nn as nn
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..'))
 
-from transformers import AutoModel  # noqa: E402
+from transformers import AutoModel
 
-from model import count_encoder_blocks, layer_index_in_name, unfreeze_last_n  # noqa: E402
+from model import count_encoder_blocks, layer_index_in_name, unfreeze_last_n
 
 MINILM = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
 MMBERT = 'jhu-clsp/mmBERT-base'
@@ -141,7 +139,7 @@ check(outside_at_one[BACKBONES[1][0]] == ['final_norm.weight'],
       str(outside_at_one[BACKBONES[1][0]]))
 
 print('\n=== separate encoders: both towers, and the optimizer groups ===')
-import model_xattn  # noqa: E402
+import model_xattn
 
 net = model_xattn.build_model(SMALL, unfreeze_layers=1, layers=1,
                               use_pooled_v=False, separate_encoders=True)

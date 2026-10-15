@@ -1,11 +1,22 @@
-__pycache__/
-*.py[cod]
+# Dữ liệu StereoQueerEval — GIỮ LOCAL, không đẩy lên GitHub
+LGBT/
+*.zip
+*.tsv
 
-# Artifacts
+# Dữ liệu/thủ công cụ HOLD cục bộ
+Homophobia-Transphobia-Detection/
+lgbtia-/
+
+# Trọng số / artifact từ notebook
 weights/
 *.pt
 *.pkl
-*.tsv
-*.csv
-.env
+stereoqueer_val_predictions.csv
+
+# Python
+__pycache__/
 .ipynb_checkpoints/
+
+# Secrets — never commit
+.env
+.env.*

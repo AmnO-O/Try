@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """SetFit contrastive baseline for Task A (stereotype detection).
 
 Non-prompt control for the prompt-MLM pipeline (train.py). Same mmBERT family,
@@ -243,7 +242,7 @@ def _mlp_head_cls():
     import torch.nn as nn
     from setfit.modeling import SetFitHead
 
-    class MLPHead(SetFitHead):  # noqa: F811
+    class MLPHead(SetFitHead):
         def __init__(self, in_features, out_features, hidden=256, dropout=0.2, device=None):
             super().__init__(in_features=in_features, out_features=out_features, device=device)
             self.hidden = hidden

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Load a Task A checkpoint and write stereotype predictions to a CSV.
 
 Usage:

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Shared configuration for Task A: stereotype detection (SemEval 2027).
 
 Single binary label: stereotype = 'yes' / 'no' on a YouTube comment plus the
@@ -64,8 +63,8 @@ PROMPT_TEMPLATES = {
         'geeft deze reactie een stereotype weer over queer mensen?',
     ),
     'FA': (
-        'ویدیو: {video}\nکامنت: {context}\nپرسش: '
-        'آیا این کامنت درباره‌ی افراد کوئیر کلیشه‌سازی می‌کند؟ پاسخ: {mask}',
+        ('ویدیو: {video}\nکامنت: {context}\nپرسش: '
+         'آیا این کامنت درباره‌ی افراد کوئیر کلیشه‌سازی می‌کند؟ پاسخ: {mask}'),
         'آیا این کامنت درباره‌ی افراد کوئیر کلیشه‌سازی می‌کند؟',
     ),
 }

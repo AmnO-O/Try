@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Round-trip (back-translation) augmentation for Task A.
 
 Translates each training row into a pivot language and back into its own

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Evidence for the encoder-decoder fusion stack (comment = decoder input).
 
 The model used to fuse with bare cross-attention: `XAttnBlock` only ever sent
@@ -37,8 +36,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..'))
 
-import model_xattn  # noqa: E402
-from model_xattn import DecoderBlock, XAttnBlock  # noqa: E402
+import model_xattn
+from model_xattn import DecoderBlock, XAttnBlock
 
 D = 16
 HEADS = 4

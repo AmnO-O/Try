@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Shared TSV readers/writers and filename language inference for Task A.
 
 Schema-compatible with `train.py`: tab-separated, QUOTE_ALL quoting

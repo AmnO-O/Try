@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Frozen-dropout invariant test for the xattn classifier.
 
 The invariant: a Dropout that sits anywhere inside a subtree whose parameters are
@@ -26,8 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..'))
 
-import model_xattn  # noqa: E402
-from model import eval_frozen_modules, unfreeze_last_n  # noqa: E402
+import model_xattn
+from model import eval_frozen_modules, unfreeze_last_n
 
 BACKBONE = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
 
@@ -167,8 +166,8 @@ audit(nets, '5b shared encoder after net.train()')
 
 print()
 print('=== 6. prompt baseline (MaskTargetedClassifier, src/train.py path) ===')
-from transformers import AutoModel  # noqa: E402
-from model import MaskTargetedClassifier  # noqa: E402
+from transformers import AutoModel
+from model import MaskTargetedClassifier
 
 base_enc = AutoModel.from_pretrained(BACKBONE)
 # A stand-in MLM head; the point is the *encoder* subtree, not the head.

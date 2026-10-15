@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Two-tower encoder-decoder classifier for Task A (stereotype yes/no).
 
 The video context (title + description) is the *encoder memory* and the comment is
@@ -13,24 +12,31 @@ outputs and read a 2-way logit.
     Z_0 = H_c  --[ N x DecoderBlock ]-->  Z_N
         DecoderBlock:  self-attn(Z, Z, Z)  ->  cross-attn(Q=Z, K=V=H_v)  ->  FFN
     Z_N  -> attn-pool ─┐
-         (--pooled-v) mean-pool(H_v) ──┴─ head
+         mean-pool(H_v) ─┴─ fusion (none|concat|gated) -> head
 
 The self-attention is what makes this a decoder rather than a bare cross-attention
 stack: it lets the comment's own tokens interact (coreference, negation scope)
 before they query the video. It is full attention - a causal mask would be wrong
 for a classification head that reads the whole comment.
 
-The head reads the pooled comment. Cross-attention is therefore the *only* channel
-from the video tower, which is the default; `use_pooled_v=True` (CLI `--pooled-v`)
-opts back into late fusion by appending a mean-pooled video vector to the head
-input. That second term is a parallel, comment-independent path - a shortcut that
-reaches the head without being filtered through the comment's own attention, so it
-can also cover for a cross-attention that learns nothing. It is off by default
-because a single run at seed 42 with it removed came out
-`sep_u2_l3 0.7213` vs `sep_u2_l3_npv 0.7396`, and because dropping it removes one
-of the two ways a video-level signal can reach the head; the honest evidence for
-that choice is `src/diag_pooled_v.py` (inference-time ablation + attention
-entropy + probes), not the 1.83pt, which sits inside the run-to-run spread.
+How the video reaches the head is chosen by `fusion` (default `gated`): `none` reads
+the pooled comment only, so cross-attention is the *only* channel from the video
+tower; `concat` appends a mean-pooled video vector to the head input; `gated` adds
+`sigmoid(W.[pooled_c; mean-pool(H_v)]) * video_proj(mean-pool(H_v))`, a learned gate
+(bias initialised to -1.5, i.e. mostly closed) on that same parallel term. The
+`concat`/`gated` term is a comment-independent path - a shortcut that reaches the head
+without being filtered through the comment's own attention, so it can cover for a
+cross-attention that learns nothing. The choice is measured in
+`src/diag_pooled_v.py` (inference-time ablation for `concat` + attention entropy +
+probes + an input-level video perturbation), not by the historical seed-42 pair
+(`0.7213` vs `0.7396`, 1.83pt), which sits inside the run-to-run spread. The old
+boolean `use_pooled_v=True/False` is kept as a compatibility keyword mapping to
+`concat`/`none`.
+
+The decoder blocks are **warm-started** from the top encoder layers by default
+(`warm_start_decoder_from_backbone`: self-attn, cross-attn, FFN and LayerNorm), so
+they start from pretrained weights instead of random init; `warm_start=False` (CLI
+`--no-warm-start`) restores random init and is the control for that choice.
 
 `forward` rejects an all-padded *video* row up front (see `_validate_video_mask`):
 with every key masked, cross-attention is undefined - the training path returns
@@ -193,6 +199,102 @@ class DecoderBlock(nn.Module):
         return (h3, weights) if return_attn else h3
 
 
+def warm_start_decoder_from_backbone(blocks: nn.ModuleList, encoder: nn.Module) -> int:
+    """Clones self-attention, cross-attention, and FFN weights from the top layers
+    of the pretrained encoder into the freshly initialized DecoderBlocks.
+
+    Returns the count of blocks successfully warm-started.
+    """
+    import re
+    layers = {}
+    for name, mod in encoder.named_modules():
+        m = re.search(r'(?:^|\.)(?:layers|layer|blocks)\.(\d+)$', name)
+        if m:
+            layers[int(m.group(1))] = mod
+
+    if not layers:
+        return 0
+
+    sorted_indices = sorted(layers.keys())
+    top_layers = [layers[i] for i in sorted_indices[-len(blocks):]]
+    count = 0
+
+    with torch.no_grad():
+        for blk, enc_layer in zip(blocks, top_layers):
+            # Check Bert / Roberta style
+            if hasattr(enc_layer, 'attention') and hasattr(enc_layer.attention, 'self'):
+                self_attn = enc_layer.attention.self
+                out_dense = enc_layer.attention.output.dense
+                q_w, k_w, v_w = self_attn.query.weight, self_attn.key.weight, self_attn.value.weight
+                in_w = torch.cat([q_w, k_w, v_w], dim=0)
+                if blk.self_attn.in_proj_weight.shape == in_w.shape:
+                    blk.self_attn.in_proj_weight.copy_(in_w)
+                    if self_attn.query.bias is not None and blk.self_attn.in_proj_bias is not None:
+                        in_b = torch.cat([self_attn.query.bias, self_attn.key.bias, self_attn.value.bias], dim=0)
+                        blk.self_attn.in_proj_bias.copy_(in_b)
+                    blk.self_attn.out_proj.weight.copy_(out_dense.weight)
+                    if out_dense.bias is not None and blk.self_attn.out_proj.bias is not None:
+                        blk.self_attn.out_proj.bias.copy_(out_dense.bias)
+
+                    # Cross-attention initialization (from the same semantic space)
+                    blk.cross_attn.in_proj_weight.copy_(in_w)
+                    if blk.cross_attn.in_proj_bias is not None and self_attn.query.bias is not None:
+                        blk.cross_attn.in_proj_bias.copy_(in_b)
+                    blk.cross_attn.out_proj.weight.copy_(out_dense.weight)
+                    if out_dense.bias is not None and blk.cross_attn.out_proj.bias is not None:
+                        blk.cross_attn.out_proj.bias.copy_(out_dense.bias)
+
+                # FFN
+                if hasattr(enc_layer, 'intermediate') and hasattr(enc_layer, 'output'):
+                    if blk.ffn[0].weight.shape == enc_layer.intermediate.dense.weight.shape:
+                        blk.ffn[0].weight.copy_(enc_layer.intermediate.dense.weight)
+                        if enc_layer.intermediate.dense.bias is not None:
+                            blk.ffn[0].bias.copy_(enc_layer.intermediate.dense.bias)
+                        blk.ffn[3].weight.copy_(enc_layer.output.dense.weight)
+                        if enc_layer.output.dense.bias is not None:
+                            blk.ffn[3].bias.copy_(enc_layer.output.dense.bias)
+
+                # LayerNorms
+                if hasattr(enc_layer.attention.output, 'LayerNorm') and hasattr(enc_layer.output, 'LayerNorm'):
+                    ln_attn = enc_layer.attention.output.LayerNorm
+                    ln_out = enc_layer.output.LayerNorm
+                    blk.norm_self.weight.copy_(ln_attn.weight)
+                    blk.norm_self.bias.copy_(ln_attn.bias)
+                    blk.norm_q.weight.copy_(ln_attn.weight)
+                    blk.norm_q.bias.copy_(ln_attn.bias)
+                    blk.norm_kv.weight.copy_(ln_attn.weight)
+                    blk.norm_kv.bias.copy_(ln_attn.bias)
+                    blk.norm_ffn.weight.copy_(ln_out.weight)
+                    blk.norm_ffn.bias.copy_(ln_out.bias)
+                count += 1
+
+            # Check ModernBERT style
+            elif hasattr(enc_layer, 'attn') and hasattr(enc_layer.attn, 'Wqkv'):
+                in_w = enc_layer.attn.Wqkv.weight
+                if blk.self_attn.in_proj_weight.shape == in_w.shape:
+                    blk.self_attn.in_proj_weight.copy_(in_w)
+                    if enc_layer.attn.Wqkv.bias is not None and blk.self_attn.in_proj_bias is not None:
+                        blk.self_attn.in_proj_bias.copy_(enc_layer.attn.Wqkv.bias)
+                    blk.self_attn.out_proj.weight.copy_(enc_layer.attn.Wo.weight)
+                    if enc_layer.attn.Wo.bias is not None and blk.self_attn.out_proj.bias is not None:
+                        blk.self_attn.out_proj.bias.copy_(enc_layer.attn.Wo.bias)
+
+                    blk.cross_attn.in_proj_weight.copy_(in_w)
+                    if enc_layer.attn.Wqkv.bias is not None and blk.cross_attn.in_proj_bias is not None:
+                        blk.cross_attn.in_proj_bias.copy_(enc_layer.attn.Wqkv.bias)
+                    blk.cross_attn.out_proj.weight.copy_(enc_layer.attn.Wo.weight)
+                    if enc_layer.attn.Wo.bias is not None and blk.cross_attn.out_proj.bias is not None:
+                        blk.cross_attn.out_proj.bias.copy_(enc_layer.attn.Wo.bias)
+
+                if hasattr(enc_layer, 'mlp') and hasattr(enc_layer.mlp, 'Wi'):
+                    if blk.ffn[0].weight.shape == enc_layer.mlp.Wi.weight.shape:
+                        blk.ffn[0].weight.copy_(enc_layer.mlp.Wi.weight)
+                        blk.ffn[3].weight.copy_(enc_layer.mlp.Wo.weight)
+                count += 1
+
+    return count
+
+
 class XAttnClassifier(nn.Module):
     """Comment-query / video-memory cross-attention classifier."""
 
@@ -204,13 +306,19 @@ class XAttnClassifier(nn.Module):
         layers: int = 1,
         dropout: float = 0.1,
         ffn_mult: int = 4,
-        use_pooled_v: bool = False,
+        use_pooled_v: bool | None = None,
+        fusion: str = 'gated',
+        warm_start: bool = True,
         separate_encoders: bool = True,
         keep_frozen_dropout: bool = False,
         pool_init_scale: float = 0.02,
     ):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(backbone)
+        # Force float32: the decoder blocks and head are fp32, and AMP keeps weights
+        # fp32 (only the forward runs under autocast), so a checkpoint shipped in
+        # bfloat16 - e.g. vllm-sr/mmbert-embed-32k-2d-matryoshka - would otherwise make
+        # the encoder output bf16 and crash the first fp32 matmul (BFloat16 != float).
+        self.encoder = AutoModel.from_pretrained(backbone).float()
         # With separate encoders the video tower gets its own copy of the same
         # pretrained checkpoint. Both start identical; the two towers can only
         # diverge in the blocks that `unfreeze_last_n` re-opens, because every
@@ -221,32 +329,36 @@ class XAttnClassifier(nn.Module):
         # their Dropout firing, i.e. the old stochastic-regularizer behaviour.
         self.keep_frozen_dropout = keep_frozen_dropout
         if separate_encoders:
-            self.encoder_v = AutoModel.from_pretrained(backbone)
+            self.encoder_v = AutoModel.from_pretrained(backbone).float()
         d = self.encoder.config.hidden_size
         self.d_model = d
-        self.use_pooled_v = use_pooled_v
+
+        # Fusion configuration: 'none', 'concat', or 'gated' (adaptive)
+        if use_pooled_v is not None:
+            self.fusion = 'concat' if use_pooled_v else 'none'
+        else:
+            self.fusion = fusion
+        self.use_pooled_v = (self.fusion == 'concat')
 
         self.blocks = nn.ModuleList(
             DecoderBlock(d, heads, dropout=dropout, ffn_mult=ffn_mult) for _ in range(layers)
         )
+        if warm_start:
+            warm_start_decoder_from_backbone(self.blocks, self.encoder)
+
         # Learnable attention-pool query over the comment-side outputs.
-        #
-        # The 0.02 is a scale choice, not a fitted constant, and it has a visible
-        # consequence: the score is `(h_c @ q) / sqrt(d)`, so with `q` at 0.02 and
-        # a MiniLM hidden state (RMS ~ 1) the scores start in a narrow band around
-        # 0 and the softmax over Lq tokens starts close to uniform, i.e. close to
-        # mean pooling. That is not a bug - the query trains - but it does mean the
-        # *initial* pooling carries almost no token selection, so "the pool learned
-        # something" has to be read relative to that baseline. `pool_init_scale`
-        # exposes it for the controlled ablation: change only this, not the FFN.
-        # `probe_pool_init.py` measures the initial entropy for several scales.
         self.pool_query = nn.Parameter(torch.randn(d) * pool_init_scale)
-        # The head reads the pooled comment. With `use_pooled_v=True` it also
-        # gets a mean-pooled video vector appended: a parallel, comment-independent
-        # path, i.e. the late-fusion fallback if the cross-attention learns little.
-        # Off by default, so cross-attention is the only channel from the video
-        # tower (see the module docstring for why, and for what backs that up).
-        head_in = 2 * d if use_pooled_v else d
+
+        # Adaptive Gated Fusion components
+        if self.fusion == 'gated':
+            self.gate = nn.Sequential(
+                nn.Linear(2 * d, d),
+                nn.Sigmoid(),
+            )
+            nn.init.constant_(self.gate[0].bias, -1.5)
+            self.video_proj = nn.Linear(d, d)
+
+        head_in = 2 * d if self.fusion == 'concat' else d
         self.head = nn.Sequential(
             nn.LayerNorm(head_in),
             nn.Dropout(dropout),
@@ -281,23 +393,23 @@ class XAttnClassifier(nn.Module):
         return [self.encoder, self.encoder_v] if self.separate_encoders else [self.encoder]
 
     def encode(self, ids, mask, tower: str = 'comment'):
-        # A fully frozen encoder runs in eval() and without gradients: its tower
-        # weights cannot change, so its dropout only adds pointless noise and its
-        # activations would be cached anyway.
-        #
-        # Trainability is decided per encoder rather than from one model-wide
-        # flag. A shared flag is wrong as soon as only one tower is re-opened,
-        # and - worse - it was what made `keep_frozen_dropout` a silent no-op in
-        # the fully frozen case: that branch called enc.eval() unconditionally,
-        # so asking to keep frozen dropout had no effect at all.
         enc = self.encoder_v if (tower == 'video' and self.separate_encoders) else self.encoder
         trainable = any(p.requires_grad for p in enc.parameters())
         if not trainable and not self.keep_frozen_dropout:
             enc.eval()
-        if not trainable:
-            with torch.no_grad():
-                return enc(input_ids=ids, attention_mask=mask).last_hidden_state
-        return enc(input_ids=ids, attention_mask=mask).last_hidden_state
+        with torch.set_grad_enabled(trainable):
+            return enc(input_ids=ids, attention_mask=mask).last_hidden_state
+
+    def fuse(self, pooled_c, pooled_v=None):
+        """Combines comment and video representations according to self.fusion."""
+        if self.fusion == 'none' or pooled_v is None:
+            return pooled_c
+        if self.fusion == 'concat':
+            return torch.cat([pooled_c, pooled_v], dim=-1)
+        if self.fusion == 'gated':
+            g = self.gate(torch.cat([pooled_c, pooled_v], dim=-1))
+            return pooled_c + g * self.video_proj(pooled_v)
+        raise ValueError(f'Unknown fusion mode {self.fusion}')
 
     @staticmethod
     def _validate_video_mask(video_mask):
@@ -334,8 +446,6 @@ class XAttnClassifier(nn.Module):
 
     def forward(self, comment_ids, comment_mask, video_ids, video_mask,
                 return_attn: bool = False):
-        # Before the video encoder or any cross-attention: an all-padded video row
-        # has no valid key, and the diagnostic path turns that into NaN.
         self._validate_video_mask(video_mask)
         h_c = self.encode(comment_ids, comment_mask, tower='comment')
         h_v = self.encode(video_ids, video_mask, tower='video')
@@ -352,44 +462,26 @@ class XAttnClassifier(nn.Module):
 
         # Attention pooling over the comment tokens.
         scores = (h_c @ self.pool_query) / math.sqrt(self.d_model)
-        # `-inf` rather than a large finite number: a finite fill would leave the
-        # padded positions a share of the softmax mass, and the pool would then
-        # quietly weight the encoder's pad-token outputs.
         scores = scores.masked_fill(q_pad, float('-inf'))
-        # A fully padded comment has no finite score at all, and `softmax` of a row
-        # of -inf is 0/0. Two things go wrong, and only the first is obvious: the
-        # forward value is NaN, and softmax's backward multiplies by its own (NaN)
-        # output, so the gradient is NaN too - the loss and every parameter go to
-        # NaN and the run is dead. Clamping *after* the softmax (`nan_to_num`,
-        # `torch.where`) repairs the forward value but not the gradient. So the
-        # row's scores are made finite *before* the softmax, and its weights are
-        # zeroed below: it pools to zeros, "no comment tokens to attend to".
-        # The data layer rejects such rows; this is the belt to its braces.
         has_token = (~q_pad).any(dim=1, keepdim=True)          # (B, 1)
         scores = torch.where(has_token, scores, torch.zeros_like(scores))
         weights = torch.softmax(scores, dim=1)
         weights = weights.masked_fill(q_pad, 0.0)
         pooled_c = torch.einsum('bl,bl d->bd', weights, h_c)
 
-        # Mean-pooled video as a parallel, comment-independent path.
+        # Mean-pooled video for late or gated fusion
         pooled_v = None
-        if self.use_pooled_v:
+        if self.fusion != 'none':
             vmask = video_mask.unsqueeze(-1).to(h_v.dtype)
             pooled_v = (h_v * vmask).sum(1) / vmask.sum(1).clamp(min=1.0)
-            features = torch.cat([pooled_c, pooled_v], dim=-1)
-        else:
-            # Cross-attention is then the *only* channel from the video tower.
-            features = pooled_c
 
+        features = self.fuse(pooled_c, pooled_v)
         logits = self.head(features)
         if not return_attn:
             return logits
-        # Diagnostics only: hand back the two pooled vectors so a pooled-v
-        # ablation can be done by re-running the head instead of re-encoding.
-        # `attn[l]` is (B, heads, Lq, Lkv) over the video keys and `weights` the
-        # (B, Lq) comment-pooling distribution.
         return logits, {'attn': attn, 'pool_weights': weights,
-                        'pooled_c': pooled_c, 'pooled_v': pooled_v}
+                        'pooled_c': pooled_c, 'pooled_v': pooled_v,
+                        'features': features}
 
 
 def build_model(backbone: str, unfreeze_layers: int = 0, **kwargs) -> XAttnClassifier:

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Is the comment attention-pool uniform at initialization?
 
 The reviewer's item 6: `pool_query = torch.randn(d) * 0.02` together with
@@ -32,8 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..'))
 
-import model_xattn  # noqa: E402
-from model import load_tokenizer  # noqa: E402
+import model_xattn
+from model import load_tokenizer
 
 BACKBONE = 'sentence-transformers/paraphrase-MiniLM-L3-v2'   # small, same d=384
 SCALES = (0.02, 0.05, 0.1, 0.5, 1.0)
