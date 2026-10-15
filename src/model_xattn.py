@@ -314,7 +314,11 @@ class XAttnClassifier(nn.Module):
         pool_init_scale: float = 0.02,
     ):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(backbone)
+        # Force float32: the decoder blocks and head are fp32, and AMP keeps weights
+        # fp32 (only the forward runs under autocast), so a checkpoint shipped in
+        # bfloat16 - e.g. vllm-sr/mmbert-embed-32k-2d-matryoshka - would otherwise make
+        # the encoder output bf16 and crash the first fp32 matmul (BFloat16 != float).
+        self.encoder = AutoModel.from_pretrained(backbone).float()
         # With separate encoders the video tower gets its own copy of the same
         # pretrained checkpoint. Both start identical; the two towers can only
         # diverge in the blocks that `unfreeze_last_n` re-opens, because every
@@ -325,7 +329,7 @@ class XAttnClassifier(nn.Module):
         # their Dropout firing, i.e. the old stochastic-regularizer behaviour.
         self.keep_frozen_dropout = keep_frozen_dropout
         if separate_encoders:
-            self.encoder_v = AutoModel.from_pretrained(backbone)
+            self.encoder_v = AutoModel.from_pretrained(backbone).float()
         d = self.encoder.config.hidden_size
         self.d_model = d
 
