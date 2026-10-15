@@ -32,6 +32,13 @@ of the two ways a video-level signal can reach the head; the honest evidence for
 that choice is `src/diag_pooled_v.py` (inference-time ablation + attention
 entropy + probes), not the 1.83pt, which sits inside the run-to-run spread.
 
+`forward` rejects an all-padded *video* row up front (see `_validate_video_mask`):
+with every key masked, cross-attention is undefined - the training path returns
+zeros silently, and the `return_attn=True` diagnostic path returns NaN weights and
+a NaN output, on top of the NaN backward pass. The comment side keeps a defensive
+fallback instead (the data layer rejects those rows first); its encoder behaviour on
+an all-zero mask is verified per backbone in `src/probe_allpad.py`.
+
 The video tower has its own encoder instance by default (`separate_encoders`), so
 the two text styles - terse/formal title+description vs. informal, often abusive
 comments - can adapt independently in the blocks that training re-opens, and the
@@ -292,8 +299,44 @@ class XAttnClassifier(nn.Module):
                 return enc(input_ids=ids, attention_mask=mask).last_hidden_state
         return enc(input_ids=ids, attention_mask=mask).last_hidden_state
 
+    @staticmethod
+    def _validate_video_mask(video_mask):
+        """Reject an all-padded video row at the model boundary.
+
+        The training data layer already refuses such rows (see
+        `train_xattn.assert_nonempty_masks`), but the model can be called from
+        anywhere - inference, `diag_pooled_v.py`, a probe - and an all-padded
+        video row is genuinely undefined:
+
+        - `need_weights=False` (the training path) answers with zeros, silently;
+        - `need_weights=True` (the `return_attn=True` diagnostic path) puts an
+          all-`-inf` row through the softmax, which is NaN - NaN weights and a NaN
+          comment output - and the backward pass is NaN too.
+
+        A valid token can be a special token, so this needs no non-empty title or
+        description: it only requires the combined, tokenised video input to keep
+        at least one unmasked token. Rejecting here means the NaN path is
+        unreachable by construction, on every backend, instead of only being
+        papered over on the optimized path.
+        """
+        if video_mask.ndim != 2 or video_mask.shape[1] == 0:
+            raise ValueError(
+                f'video_mask must have shape [batch, seq_len] with seq_len > 0, '
+                f'got {tuple(video_mask.shape)}')
+        per_row = video_mask.bool().any(dim=1)
+        if not bool(per_row.all()):
+            bad = (~per_row).nonzero(as_tuple=False).flatten().tolist()
+            raise ValueError(
+                f'{len(bad)} video row(s) have no valid token (first: row {bad[0]}). '
+                f'Every video context must contain at least one unmasked token: with '
+                f'every key masked, cross-attention is undefined - the training path '
+                f'answers with zeros and the need_weights=True diagnostic path with NaN.')
+
     def forward(self, comment_ids, comment_mask, video_ids, video_mask,
                 return_attn: bool = False):
+        # Before the video encoder or any cross-attention: an all-padded video row
+        # has no valid key, and the diagnostic path turns that into NaN.
+        self._validate_video_mask(video_mask)
         h_c = self.encode(comment_ids, comment_mask, tower='comment')
         h_v = self.encode(video_ids, video_mask, tower='video')
 

@@ -8,11 +8,13 @@ Two claims to check:
      multiplies by its own NaN output, so the gradient is NaN too, the loss is NaN
      and the run dies.
   2. All-padded video. The training path (`need_weights=False`) answers with zeros;
-     the `need_weights=True` diagnostic path answers with NaN.
+     the `need_weights=True` diagnostic path answers with NaN - weights *and* the
+     comment output.
 
 The fix: make the row's scores finite *before* the softmax (repairing the value
 after the softmax fixes the forward number but not the gradient), and reject such
-rows at load time.
+rows at load time - and, for the video side, at the model boundary too, so a caller
+outside the trainer (inference, diagnostics, a probe) cannot reach the NaN path.
 
 Run:  python src/probe_allpad.py
 Exit code 0 = every assertion holds.
@@ -205,18 +207,63 @@ check(bad_diff > 0, '4f only the malformed row moves off the reference',
       f'max abs diff {bad_diff:.2e}')
 
 print()
-print('=== 5. an all-padded video row through the real model ===')
+print('=== 5. the model boundary rejects an all-padded video ===')
+# Section 2 showed the raw MHA path is unsafe when every key is masked: zeros on
+# the training path, NaN (weights and output) on the diagnostic path. The model
+# now refuses such a row up front, so neither behaviour is reachable through the
+# public API - on any backend, not just where the optimized path happens to run.
 v_bad = v_m.clone()
-v_bad[2] = 0
+v_bad[2] = 0                                        # row 2: no video tokens at all
+for label, kwargs in (('training path', {}), ('diagnostic path', {'return_attn': True})):
+    try:
+        with torch.no_grad():
+            net(c_ids, c_m, v_ids, v_bad, **kwargs)
+        check(False, f'5a {label}: raises on an all-padded video row')
+    except ValueError as err:
+        msg = str(err)
+        check('video' in msg and 'row 2' in msg,
+              f'5a {label}: raises and names the issue', msg[:60] + '...')
+
+# The shape guard, so a malformed mask is caught as clearly as an empty one.
+for bad_mask, label in (
+    (torch.ones(3, dtype=torch.long), 'a 1-D mask'),
+    (torch.ones(3, 0, dtype=torch.long), 'a zero-length mask'),
+):
+    try:
+        with torch.no_grad():
+            net(c_ids, c_m, v_ids, bad_mask)
+        check(False, f'5b rejects {label}')
+    except ValueError:
+        check(True, f'5b rejects {label}')
+
+# A well-formed batch still runs, so the guard is not simply blocking everything.
 with torch.no_grad():
-    logits_v = net(c_ids, c_m, v_ids, v_bad)
-    _, aux_v = net(c_ids, c_m, v_ids, v_bad, return_attn=True)
-check(bool(torch.isfinite(logits_v).all()), '5a training path: finite output')
-check(bool(torch.isnan(aux_v['attn'][0][2]).any()),
-      '5b diagnostic path: NaN attention weights for that row')
-print('      -> for the training path an all-padded video degrades silently to zeros;')
-print('         for the diagnostic path it is NaN. The section 3 guard rejects the row')
-print('         before either can happen, so both are unreachable by construction.')
+    ok_logits = net(c_ids, c_m, v_ids, v_m)
+check(bool(torch.isfinite(ok_logits).all()),
+      '5c a well-formed batch still runs and is finite')
+print('      -> the raw MHA is unsafe for an all-masked key row (section 2); the model')
+print('         boundary rejects that row before the encoder or cross-attention, so')
+print('         the NaN path is unreachable by construction.')
+
+print()
+print('=== 6. the comment fallback is safe on each supported backbone ===')
+# The comment side keeps a defensive fallback (encoder on an all-zero mask, then
+# the decoder/pooling guard). The preprocessing guard is the primary defence, but
+# the fallback still runs the encoder on an all-zero mask, so that has to be finite
+# or the fallback would be silently useless. Checked on both supported backbones.
+from transformers import AutoModel, AutoTokenizer  # noqa: E402
+
+for label, backbone in (('MiniLM-L12 (BERT-style)', BACKBONE),
+                        ('mmBERT-base (ModernBERT)', 'jhu-clsp/mmBERT-base')):
+    tok = AutoTokenizer.from_pretrained(backbone)
+    enc = AutoModel.from_pretrained(backbone)
+    enc.eval()
+    ids = torch.tensor([[tok.cls_token_id or 0, tok.sep_token_id or 0, 5, 6]])
+    with torch.no_grad():
+        hidden = enc(input_ids=ids, attention_mask=torch.zeros_like(ids)).last_hidden_state
+    check(bool(hidden.isfinite().all()),
+          f'6 encoder on an all-zero mask is finite [{label}]',
+          f'hidden {tuple(hidden.shape)}')
 
 print()
 if FAILURES:
