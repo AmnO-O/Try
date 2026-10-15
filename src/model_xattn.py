@@ -12,25 +12,31 @@ outputs and read a 2-way logit.
     Z_0 = H_c  --[ N x DecoderBlock ]-->  Z_N
         DecoderBlock:  self-attn(Z, Z, Z)  ->  cross-attn(Q=Z, K=V=H_v)  ->  FFN
     Z_N  -> attn-pool ─┐
-         (--pooled-v) mean-pool(H_v) ──┴─ head
+         mean-pool(H_v) ─┴─ fusion (none|concat|gated) -> head
 
 The self-attention is what makes this a decoder rather than a bare cross-attention
 stack: it lets the comment's own tokens interact (coreference, negation scope)
 before they query the video. It is full attention - a causal mask would be wrong
 for a classification head that reads the whole comment.
 
-The head reads the pooled comment. Cross-attention is therefore the *only* channel
-from the video tower, which is the default; `use_pooled_v=True` (CLI `--pooled-v`)
-opts back into late fusion by appending a mean-pooled video vector to the head
-input. That second term is a parallel, comment-independent path - a shortcut that
-reaches the head without being filtered through the comment's own attention, so it
-can also cover for a cross-attention that learns nothing. It is off by default
-because a single run at seed 42 with it removed came out
-`sep_u2_l3 0.7213` vs `sep_u2_l3_npv 0.7396`, and because dropping it removes one
-of the two ways a video-level signal can reach the head; the honest evidence for
-that choice is `src/diag_pooled_v.py` (inference-time ablation + attention entropy
-+ probes + an input-level video perturbation), not the 1.83pt, which sits inside
-the run-to-run spread.
+How the video reaches the head is chosen by `fusion` (default `gated`): `none` reads
+the pooled comment only, so cross-attention is the *only* channel from the video
+tower; `concat` appends a mean-pooled video vector to the head input; `gated` adds
+`sigmoid(W.[pooled_c; mean-pool(H_v)]) * video_proj(mean-pool(H_v))`, a learned gate
+(bias initialised to -1.5, i.e. mostly closed) on that same parallel term. The
+`concat`/`gated` term is a comment-independent path - a shortcut that reaches the head
+without being filtered through the comment's own attention, so it can cover for a
+cross-attention that learns nothing. The choice is measured in
+`src/diag_pooled_v.py` (inference-time ablation for `concat` + attention entropy +
+probes + an input-level video perturbation), not by the historical seed-42 pair
+(`0.7213` vs `0.7396`, 1.83pt), which sits inside the run-to-run spread. The old
+boolean `use_pooled_v=True/False` is kept as a compatibility keyword mapping to
+`concat`/`none`.
+
+The decoder blocks are **warm-started** from the top encoder layers by default
+(`warm_start_decoder_from_backbone`: self-attn, cross-attn, FFN and LayerNorm), so
+they start from pretrained weights instead of random init; `warm_start=False` (CLI
+`--no-warm-start`) restores random init and is the control for that choice.
 
 `forward` rejects an all-padded *video* row up front (see `_validate_video_mask`):
 with every key masked, cross-attention is undefined - the training path returns
@@ -300,7 +306,7 @@ class XAttnClassifier(nn.Module):
         layers: int = 1,
         dropout: float = 0.1,
         ffn_mult: int = 4,
-        use_pooled_v: bool = None,
+        use_pooled_v: bool | None = None,
         fusion: str = 'gated',
         warm_start: bool = True,
         separate_encoders: bool = True,
