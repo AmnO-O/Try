@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Does _extract_parts hand back the *pretrained* head, on every layout?
 
 `load_model` is the prompt baseline: encoder -> pretrained MLM head -> Linear,
@@ -39,13 +38,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..'))
 
-from transformers import (  # noqa: E402
+from transformers import (
     BertConfig, BertForMaskedLM,
     ModernBertConfig, ModernBertForMaskedLM,
     RobertaConfig, RobertaForMaskedLM,
 )
 
-from model import _extract_parts  # noqa: E402
+from model import _extract_parts
 
 HIDDEN = 32
 FAILURES = []

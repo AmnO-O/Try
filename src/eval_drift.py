@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Estimate semantic drift of round-trip paraphrases with a confidence interval.
 
 Reads the *_review_<LANG>.tsv files written by augment_roundtrip.py and scores

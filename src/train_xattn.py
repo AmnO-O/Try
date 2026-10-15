@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Train the two-tower encoder-decoder classifier (see model_xattn.py).
 
 Same data pipeline, split, labels, metrics and early-stopping conventions as
@@ -258,12 +257,14 @@ def parse_args(argv=None):
                         help='Keep the title in the K/V stream even when it is also a query field, '
                              'so the title is added in-sequence without losing its attention and '
                              'pooled-video channels (a "duplicate title" format).')
-    parser.add_argument('--pooled-v', action=argparse.BooleanOptionalAction, default=False,
-                        help='Append a mean-pooled video vector to the head input, i.e. late '
-                             'fusion of the video tower next to the cross-attention. OFF by '
-                             'default: the cross-attention stack is then the only path from the '
-                             '"video" tower. `--no-pooled-v` states the default explicitly. '
-                             'See src/diag_pooled_v.py before quoting any difference.')
+    parser.add_argument('--fusion', choices=['none', 'concat', 'gated'], default='gated',
+                        help='Fusion strategy: "gated" (learnable adaptive gate blending video prior, default), '
+                             '"none" (pure cross-attention), or "concat" (legacy late fusion)')
+    parser.add_argument('--warm-start', action=argparse.BooleanOptionalAction, default=True,
+                        help='Warm-start DecoderBlocks from top encoder layers (default: True)')
+    parser.add_argument('--pooled-v', action=argparse.BooleanOptionalAction, default=None,
+                        help='Append a mean-pooled video vector to the head input (equivalent to --fusion concat). '
+                             'Maintained for backward compatibility; prefer --fusion.')
     parser.add_argument('--shared-encoder', action='store_true',
                         help='Share one encoder between the comment and video towers instead of '
                              'giving each tower its own copy (the default). Halves the parameter '
@@ -362,10 +363,12 @@ def main():
     unfreeze_epoch = args.freeze_epochs + 1 if args.freeze_epochs > 0 else None
     build_unfreeze = 0 if unfreeze_epoch is not None else args.unfreeze_layers
 
+    fusion_choice = 'concat' if args.pooled_v else args.fusion
     net = model_xattn.build_model(
         args.backbone, unfreeze_layers=build_unfreeze,
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
-        use_pooled_v=args.pooled_v, separate_encoders=not args.shared_encoder,
+        fusion=fusion_choice, warm_start=args.warm_start,
+        separate_encoders=not args.shared_encoder,
         keep_frozen_dropout=args.keep_frozen_dropout, pool_init_scale=args.pool_init_scale,
     ).to(device)
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
@@ -373,7 +376,7 @@ def main():
     encoders = 'separate' if net.separate_encoders else 'shared'
     print(f'  d_model {net.d_model} | heads {args.heads} | decoder layers {args.layers} | '
           f'pool-init-scale {args.pool_init_scale:g} | ')
-    print(f'  encoders {encoders} | head in {"pooled_c+pooled_v" if net.use_pooled_v else "pooled_c only"} | '
+    print(f'  fusion {net.fusion} | warm-start {"ON" if args.warm_start else "OFF"} | encoders {encoders} | '
           f'trainable {trainable/1e6:.2f}M / {total/1e6:.2f}M params')
     print(f'  lr: backbone {args.backbone_lr:g} | xattn blocks {args.xattn_lr:g} '
           f'({sum(p.numel() for p in model_xattn.trainable_groups(net)[1])/1e6:.2f}M params) | '

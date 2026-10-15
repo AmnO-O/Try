@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """pooled_v diagnostics: does the head use the shortcut, and what does it cost?
 
 Runs on a trained checkpoint only - no retraining, a handful of forward passes:
@@ -118,10 +117,17 @@ def infer_arch(state):
     d = int(state['blocks.0.norm_q.weight'].numel())
     head_in = int(state['head.2.weight'].shape[1])
     layers = 1 + max(int(k.split('.')[1]) for k in state if k.startswith('blocks.'))
+    if any(k.startswith('gate.') for k in state):
+        fusion = 'gated'
+    elif head_in == 2 * d:
+        fusion = 'concat'
+    else:
+        fusion = 'none'
     return {
         'd_model': d,
         'layers': layers,
-        'use_pooled_v': head_in == 2 * d,
+        'fusion': fusion,
+        'use_pooled_v': fusion == 'concat',
         'separate_encoders': any(k.startswith('encoder_v.') for k in state),
     }
 
@@ -130,7 +136,7 @@ def build_from_state(state, backbone, heads, dropout, device):
     arch = infer_arch(state)
     net = model_xattn.build_model(
         backbone, unfreeze_layers=0, heads=heads, layers=arch['layers'], dropout=dropout,
-        use_pooled_v=arch['use_pooled_v'], separate_encoders=arch['separate_encoders'])
+        fusion=arch['fusion'], warm_start=False, separate_encoders=arch['separate_encoders'])
     net.load_state_dict(state)
     net.eval()
     net.to(device)
@@ -220,10 +226,9 @@ def forward_pass(net, loader, device):
         probs.append(torch.softmax(logits.float(), dim=1)[:, 1].cpu().numpy())
         labels.append(label.numpy())
 
-        # The ablation below assumes head(cat[pooled_c, pooled_v]) is bit-for-bit
+        # The ablation below assumes head(fuse(pooled_c, pooled_v)) is bit-for-bit
         # the model's own forward; check it instead of trusting it.
-        feats = torch.cat([aux['pooled_c'], aux['pooled_v']], dim=-1) \
-            if aux['pooled_v'] is not None else aux['pooled_c']
+        feats = net.fuse(aux['pooled_c'], aux['pooled_v'])
         head_gap = max(head_gap, float((net.head(feats) - logits).abs().max()))
 
         # Per-head entropy / top-1, averaged over the *unmasked* query rows. The
@@ -345,7 +350,6 @@ def main():
         print('  Compare its section C/D against a with-pooled_v checkpoint instead.')
     else:
         pc = torch.from_numpy(res['pooled_c'])
-        pv = torch.from_numpy(res['pooled_v'])
         conds = {
             'as trained': res['pooled_v'],
             'pooled_v := 0': np.zeros_like(res['pooled_v']),
@@ -379,7 +383,7 @@ def main():
     print('  cross-attn entropy per layer (bits)  ' + ' '.join(f'{e:.3f}' for e in ent) +
           f' | mean {np.mean(ent):.3f} (ceiling log2(mean valid video tokens '
           f'{res["mean_video_tokens"]:.0f}) = {math.log2(max(res["mean_video_tokens"], 2.0)):.2f})')
-    print(f'  cross-attn top-1 weight per layer    ' +
+    print('  cross-attn top-1 weight per layer    ' +
           ' '.join(f'{t:.3f}' for t in res['top1_weight']) +
           f' | mean {np.mean(res["top1_weight"]):.3f}')
     print(f'  comment-pool entropy {res["pool_entropy_bits"]:.3f} bits')

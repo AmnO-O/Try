@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Fine-tune mmBERT for Task A: stereotype detection (yes / no) via MLM prompting.
 
 Usage:
