@@ -29,8 +29,9 @@ can also cover for a cross-attention that learns nothing. It is off by default
 because a single run at seed 42 with it removed came out
 `sep_u2_l3 0.7213` vs `sep_u2_l3_npv 0.7396`, and because dropping it removes one
 of the two ways a video-level signal can reach the head; the honest evidence for
-that choice is `src/diag_pooled_v.py` (inference-time ablation + attention
-entropy + probes), not the 1.83pt, which sits inside the run-to-run spread.
+that choice is `src/diag_pooled_v.py` (inference-time ablation + attention entropy
++ probes + an input-level video perturbation), not the 1.83pt, which sits inside
+the run-to-run spread.
 
 `forward` rejects an all-padded *video* row up front (see `_validate_video_mask`):
 with every key masked, cross-attention is undefined - the training path returns

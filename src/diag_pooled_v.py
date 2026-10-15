@@ -19,14 +19,31 @@ are not re-run, so this is exact and ~free, and it needs no second training run.
   from "the head merely tolerates the extra 384 inputs".
 - A model that has learned to ignore pooled_v scores the same on all three.
 
+What B does *not* say: it measures the reliance of a model that was **trained with**
+pooled_v, so it cannot show whether training with or without the branch changes the
+final metric. That question needs the train-time arm (both variants, several seeds,
+same video split, mean +/- spread) - not this section.
+
 **C. Representation.** The cross-attention entropy over the video keys (is the
-attention peaked or diffuse?) and the size of the two pooled vectors.
+attention peaked or diffuse?) and the size of the two pooled vectors. Entropy and
+attention maps localise *where* the model looks; they are not, on their own,
+evidence that the model causally relies on the video. Use E for that.
 
 **D. Probes.** A logistic regression on the *frozen* pooled vectors, fitted on
 train rows and scored on val: how much label information does each path carry on
 its own? Together with C this tests the pre-registered prediction that removing
 `pooled_v` forces the cross-attention to work harder, i.e. entropy down and the
 `pooled_c` probe up.
+
+**E. Video-context perturbation.** Change the video *input* and re-run the whole
+model: permute videos within / across languages, or replace every unmasked video
+token with a constant. Every arm keeps the per-row mask and sequence length, so
+only the content changes. Because the paired video is destroyed while the comment
+stays well-formed, a macro-F1 drop is a direct, causal statement that the model
+uses the paired video - which is exactly what B and C cannot establish. It is only
+as specific as the checkpoint is trained (an under-trained model can move its output
+under any input change), so it is meant to run on the same checkpoint the other
+sections do, and its `as-is` arm is checked against section A.
 
 `--probe-train-rows` sets how many TRAIN rows get encoded for the probe fit
 (0 skips section D and the extra encoder pass). `--max-val-rows` truncates val
@@ -151,6 +168,16 @@ def head_prob_yes(net, features, device):
     with torch.no_grad():
         logits = net.head(features.to(device))
     return torch.softmax(logits.float(), dim=1)[:, 1].cpu().numpy()
+
+
+@torch.no_grad()
+def predict(net, loader, device):
+    """Whole-model forward over a loader -> P(yes). Used by the perturbation test."""
+    probs = []
+    for cids, cmask, vids, vmask, _ in loader:
+        logits = net(cids.to(device), cmask.to(device), vids.to(device), vmask.to(device))
+        probs.append(torch.softmax(logits.float(), dim=1)[:, 1].cpu().numpy())
+    return np.concatenate(probs) if probs else np.zeros(0)
 
 
 def shifted_index(langs, within_language, seed=0):
@@ -384,10 +411,80 @@ def main():
             print(f'  {name:<32} {m["macro_f1"]:>8.4f} {m["acc"]:>7.4f} '
                   f'{m["recall_yes"]:>10.4f} {m["auc"]:>7.4f}')
 
+    # ---- E. video-context perturbation (input-level causal test) -----------
+    # B and C act on the head's features and on the representation; neither changes
+    # what the cross-attention actually saw, and neither is a statement about the
+    # model *relying* on the paired video. Here the video input itself is changed and
+    # the whole model is re-run. If the model uses the paired video, breaking the
+    # pairing or emptying the content must cost macro-F1. If it barely moves, the
+    # attention it spends on the video is not evidence that it needs the video.
+    #
+    # All arms keep the batch layout and the per-row video mask intact: the permuted
+    # arms swap whole (ids, mask) pairs between rows, and the constant arm replaces
+    # every unmasked token id with one constant while leaving the mask alone. So the
+    # only thing that changes is the video content, not the sequence length.
+    print('\n--- E. video-context perturbation (whole model, video input changed) ---')
+    from torch.utils.data import DataLoader
+    from train_xattn import collate_paired
+
+    ds = val_loader.dataset
+    items = [ds[i] for i in range(len(ds))]
+    idx_in = shifted_index(langs, within_language=True)
+    idx_out = shifted_index(langs, within_language=False)
+    const_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    def rebuild(perm=None, constant=False):
+        out = []
+        for k, (cids, cmask, _vids, _vmask, lab) in enumerate(items):
+            j = k if perm is None else int(perm[k])
+            vids, vmask = items[j][2], items[j][3]
+            if constant:
+                vids = [const_id if m else t for t, m in zip(vids, vmask)]
+            out.append((cids, cmask, vids, vmask, lab))
+        return out
+
+    def run(perturbed):
+        loader = DataLoader(perturbed, batch_size=args.batch_size, shuffle=False,
+                            collate_fn=lambda b: collate_paired(b, tokenizer.pad_token_id))
+        return predict(net, loader, device)
+
+    variants_e = {
+        'as-is (paired video)': rebuild(),
+        'video permuted within lang': rebuild(perm=idx_in),
+        'video permuted across lang': rebuild(perm=idx_out),
+        'video content := constant': rebuild(constant=True),
+    }
+    perturb = {}
+    print(f'  {"condition":<28} {"macro_f1":>8} {"delta":>8} {"acc":>7} '
+          f'{"recall_yes":>10} {"auc":>7}')
+    for name, perturbed in variants_e.items():
+        m = metrics(run(perturbed), res['labels'])
+        perturb[name] = m
+        print(f'  {name:<28} {m["macro_f1"]:>8.4f} {m["macro_f1"] - overall["macro_f1"]:>+8.4f} '
+              f'{m["acc"]:>7.4f} {m["recall_yes"]:>10.4f} {m["auc"]:>7.4f}')
+    # The as-is arm re-runs the model, so it must reproduce section A exactly.
+    e_as_is = abs(perturb['as-is (paired video)']['macro_f1'] - overall['macro_f1'])
+    if e_as_is > 1e-9:
+        print(f'  WARNING: as-is arm differs from section A by {e_as_is:.2e} (expected 0)')
+    d_pair = overall['macro_f1'] - perturb['video permuted within lang']['macro_f1']
+    d_const = overall['macro_f1'] - perturb['video content := constant']['macro_f1']
+    if d_const > 0.02:
+        perturb_verdict = (f'the model uses the paired video: emptying it costs '
+                           f'{d_const:+.4f} macro-F1 (breaking the pairing costs {d_pair:+.4f})')
+    elif d_const > 0.005:
+        perturb_verdict = (f'the model uses the video, but the cost ({d_const:+.4f}) is inside '
+                           f'the run-to-run spread - repeat before believing it')
+    else:
+        perturb_verdict = (f'the model barely uses the paired video (emptying it costs only '
+                           f'{d_const:+.4f} macro-F1): its attention on the video is not '
+                           f'evidence of reliance')
+    print(f'  reading: {perturb_verdict}')
+
     if args.json:
         payload = {'checkpoint': args.checkpoint, 'arch': arch, 'heads': args.heads,
                    'quality': {'overall': overall, 'per_language': per_lang},
                    'ablation': ablation,
+                   'perturbation': perturb,
                    'representation': {k: res[k] for k in
                                       ('entropy_bits', 'top1_weight', 'pool_entropy_bits',
                                        'mean_video_tokens', 'self_check_head_gap')},
