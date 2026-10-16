@@ -10,6 +10,13 @@ separate-encoder default is ~614M *before* the decoder stack and head.
 That is why the reviewer's memory point stands: separate encoders are a
 deliberate experimental variable, not a free lunch.
 
+Two rows were added for the encoder comparison in
+``scripts/run_xattn_screen.py``: ``e5-small`` (the same 12x384 shape as MiniLM,
+so its row is MiniLM's - which is what makes it a cheap drop-in rather than a
+cost decision) and ``jina-nano`` (12x768 EuroBERT, loaded natively by
+``model_xattn.load_encoder``; a bigger encoder *and* a bigger trainable slice at
+--unfreeze-layers 2).
+
 Counts are built from the real classes on the meta device, so they are the
 model's own parameter count without paying for the weights. The trainable column
 uses `unfreeze_last_n(encoder, n)` on the same meta module.
@@ -27,13 +34,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, '..'))
 
-from transformers import AutoConfig, AutoModel  # noqa: E402
+from transformers import AutoModel  # noqa: E402
 
 import model_xattn  # noqa: E402
 from model import count_encoder_blocks, unfreeze_last_n  # noqa: E402
 
 BACKBONES = [
     ('MiniLM-L12', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'),
+    ('e5-small', 'intfloat/multilingual-e5-small'),
+    ('jina-nano', 'jinaai/jina-embeddings-v5-text-nano'),
     ('mmBERT-base', 'jhu-clsp/mmBERT-base'),
 ]
 HEAD = 4
@@ -46,6 +55,18 @@ TRAIN_MULTIPLIER = 4
 
 def count(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
+
+
+def build_meta(config, cls) -> nn.Module:
+    """An unloaded model on the meta device, for counting parameters.
+
+    transformers 5 keeps `from_config` on the auto classes only, so the generic
+    branch goes through `AutoModel.from_config` while a concrete class
+    (`EuroBertModel`, which the auto mapping cannot resolve for a
+    `jina_embeddings_v5` config) is built from its config directly. Both allocate
+    no memory on the meta device, which is the point of this script.
+    """
+    return AutoModel.from_config(config) if cls is AutoModel else cls(config)
 
 
 def stack_counts(d_model: int):
@@ -63,10 +84,10 @@ print(f'{"backbone":<12} {"blocks":>6} {"d":>5} | {"1 encoder":>10} {"stack":>8}
 print('-' * 104)
 
 for label, backbone in BACKBONES:
-    config = AutoConfig.from_pretrained(backbone)
+    config, cls = model_xattn.encoder_model_class(backbone)
     d_model = config.hidden_size
     with torch.device('meta'):
-        encoder = AutoModel.from_config(config)
+        encoder = build_meta(config, cls)
     encoder_params = count(encoder)
     n_found = count_encoder_blocks(encoder)
     block_n, pool_n, head_n = stack_counts(d_model)

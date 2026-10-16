@@ -60,13 +60,88 @@ MiniLM, but ~642M vs ~335M for mmBERT; the two towers alone are ~614M vs ~307M
 for mmBERT, before the decoder stack).
 """
 
+import json
 import math
+import os
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from huggingface_hub import hf_hub_download
+from transformers import AutoConfig, AutoModel
 
 DEFAULT_BACKBONE = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+
+# Backbones whose checkpoint carries modelling code of its own (`auto_map`), so
+# plain `AutoModel.from_pretrained` refuses to load it without
+# `trust_remote_code=True`, but whose `model.safetensors` is a plain state dict for
+# a class `transformers` already ships.
+#
+# Jina's v5 text models are the case this exists for: `jina_embeddings_v5` is
+# EuroBERT-210m (a *bidirectional* Llama-style encoder - `is_causal = False`) that
+# Jina distilled from Qwen3-Embedding-4B. Their repo declares
+# `JinaEmbeddingsV5Model`, a PEFT wrapper that attaches four task LoRA adapters
+# (`retrieval`, `text-matching`, `clustering`, `classification`) and defaults to
+# `retrieval` active, i.e. trained on `Query:`/`Document:`-prefixed text.
+# Loading that wrapper would execute remote code, add a `peft` dependency, and
+# silently run the retrieval adapter over our unprefixed comments and video text.
+# `probe_backbone.py` verifies the shipped weights are a 1:1 `EuroBertModel` state
+# dict (110/110 keys), so the native class loads the same distilled weights
+# without any of that.
+EUROBERT_MODEL_TYPES = frozenset({'jina_embeddings_v5'})
+
+
+def encoder_model_type(backbone: str) -> str:
+    """`model_type` from a checkpoint's `config.json`, read as plain JSON.
+
+    Deliberately not `AutoConfig.from_pretrained`: for a repo with an `auto_map`
+    that call *raises* instead of returning the config, and telling those repos
+    apart is the whole point of reading the field here. A local directory is read
+    directly, a Hub id through the usual cache.
+    """
+    if os.path.isdir(backbone):
+        path = os.path.join(backbone, 'config.json')
+    else:
+        path = hf_hub_download(backbone, 'config.json')
+    with open(path, encoding='utf-8') as fh:
+        return json.load(fh).get('model_type', '')
+
+
+def encoder_model_class(backbone: str):
+    """The `(config, class)` pair for `backbone`, without loading any weights.
+
+    Separate from `load_encoder` so `report_cost.py` can instantiate the same class
+    on the meta device - it counts parameters and must not download or allocate
+    them - and so the family decision is made in exactly one place.
+    """
+    if encoder_model_type(backbone) in EUROBERT_MODEL_TYPES:
+        try:
+            from transformers import EuroBertConfig, EuroBertModel
+        except ImportError as exc:  # depends on the installed transformers
+            import transformers
+
+            raise ImportError(
+                f'{backbone} needs a native EuroBERT implementation '
+                f'(transformers.EuroBertModel); transformers '
+                f'{transformers.__version__} does not ship one. Upgrade with '
+                f'`pip install -U transformers` (verified on 5.19.0). Loading the '
+                f"repo's own modelling code instead is deliberately not a fallback: "
+                f'it needs trust_remote_code and hands back the PEFT LoRA wrapper, '
+                f'which is what this whole path exists to avoid.'
+            ) from exc
+        return EuroBertConfig.from_pretrained(backbone), EuroBertModel
+    return AutoConfig.from_pretrained(backbone), AutoModel
+
+
+def load_encoder(backbone: str):
+    """One tower's pretrained encoder, whichever family `backbone` belongs to.
+
+    Every backbone the repo shipped with (MiniLM, e5, mmBERT) goes through
+    `AutoModel` unchanged. `EUROBERT_MODEL_TYPES` is the exception, for the reason
+    documented there.
+    """
+    config, cls = encoder_model_class(backbone)
+    return cls.from_pretrained(backbone, config=config)
+
 
 # Parameter-name prefixes that belong to the encoder towers. With
 # `separate_encoders` the video tower is a second instance named `encoder_v`, so
@@ -210,7 +285,7 @@ class XAttnClassifier(nn.Module):
         pool_init_scale: float = 0.02,
     ):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(backbone)
+        self.encoder = load_encoder(backbone)
         # With separate encoders the video tower gets its own copy of the same
         # pretrained checkpoint. Both start identical; the two towers can only
         # diverge in the blocks that `unfreeze_last_n` re-opens, because every
@@ -221,7 +296,7 @@ class XAttnClassifier(nn.Module):
         # their Dropout firing, i.e. the old stochastic-regularizer behaviour.
         self.keep_frozen_dropout = keep_frozen_dropout
         if separate_encoders:
-            self.encoder_v = AutoModel.from_pretrained(backbone)
+            self.encoder_v = load_encoder(backbone)
         d = self.encoder.config.hidden_size
         self.d_model = d
         self.use_pooled_v = use_pooled_v
