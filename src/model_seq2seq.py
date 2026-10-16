@@ -77,9 +77,10 @@ from transformers import AutoModelForSeq2SeqLM
 DEFAULT_BACKBONE = 'facebook/mbart-large-50'
 
 # Language codes for the tokenizers used by the supported backbones.
-# mBART-50 uses IETF-style tags; NLLB-200 uses BCP-47 + script.
-MBART_LANG_CODES = {'EN': 'en_XX', 'IT': 'it_IT', 'NL': 'nl_XX', 'FA': 'fa_IR'}
-NLLB_LANG_CODES  = {'EN': 'eng_Latn', 'IT': 'ita_Latn', 'NL': 'nld_Latn', 'FA': 'pes_Arab'}
+# mBART-50 uses IETF-style tags; NLLB-200 uses BCP-47 + script; M2M-100 uses ISO 2-letter codes.
+MBART_LANG_CODES  = {'EN': 'en_XX', 'IT': 'it_IT', 'NL': 'nl_XX', 'FA': 'fa_IR'}
+NLLB_LANG_CODES   = {'EN': 'eng_Latn', 'IT': 'ita_Latn', 'NL': 'nld_Latn', 'FA': 'pes_Arab'}
+M2M100_LANG_CODES = {'EN': 'en', 'IT': 'it', 'NL': 'nl', 'FA': 'fa'}
 
 _NLLB_HUBS = frozenset({
     'facebook/nllb-200-distilled-600m',
@@ -94,8 +95,14 @@ _NLLB_HUBS = frozenset({
 # ---------------------------------------------------------------------------
 
 def is_nllb_backbone(backbone: str) -> bool:
-    """True when the backbone uses NLLB-200 / M2M-100 lang-tag conventions."""
+    """True when the backbone uses NLLB-200 lang-tag conventions."""
     return backbone.lower() in _NLLB_HUBS or 'nllb' in backbone.lower()
+
+
+def is_m2m100_backbone(backbone: str) -> bool:
+    """True when the backbone uses original M2M-100 ISO codes (en, it, nl)."""
+    b = backbone.lower()
+    return 'm2m100' in b and not is_nllb_backbone(backbone)
 
 
 def lang_code_for(backbone: str, lang: str) -> str:
@@ -105,7 +112,13 @@ def lang_code_for(backbone: str, lang: str) -> str:
     (``'EN'``, ``'IT'``, ``'NL'``, ``'FA'``).  Returns the backbone-specific
     string; raises ``KeyError`` with a clear message for unknown languages.
     """
-    table = NLLB_LANG_CODES if is_nllb_backbone(backbone) else MBART_LANG_CODES
+    if is_nllb_backbone(backbone):
+        table = NLLB_LANG_CODES
+    elif is_m2m100_backbone(backbone):
+        table = M2M100_LANG_CODES
+    else:
+        table = MBART_LANG_CODES
+
     if lang not in table:
         available = ', '.join(sorted(table))
         raise KeyError(
