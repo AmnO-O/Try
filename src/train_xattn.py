@@ -21,6 +21,10 @@ Usage:
     python src/train_xattn.py --shared-encoder --layers 3   # one shared encoder (pre-2026 default)
     python src/train_xattn.py --pooled-v --layers 3         # late fusion: append mean-pooled video
                                                             # to the head (OFF by default)
+    python src/train_xattn.py --hate-aux-weight 0.5 --layers 3
+                                                            # + train-time 3-way hate_speech aux CE
+                                                            # on the same pooled vector (inference
+                                                            # reads the main head only)
 """
 
 import argparse
@@ -63,6 +67,12 @@ FIELD_COLUMNS = {'comment': 'yt_comment', 'title': 'yt_title', 'description': 'y
 # Only the short fields may move into the query stream; description is long
 # (mean 91 tokens, 27% over 128) and would eat the comment budget.
 QUERY_CHOICES = ('comment', 'title')
+
+# The auxiliary `hate_speech` readout (`--hate-aux-weight`), a training-time
+# scaffold on the same pooled vector (see model_xattn's module docstring). The
+# corpus carries the ordinal hate scale {no, yes_implicit, yes_explicit}; a 3-way
+# head keeps the implicit/explicit distinction that a binary collapse would lose.
+HATE_MAP = {'no': 0, 'yes_implicit': 1, 'yes_explicit': 2}
 
 
 def sep_for(tokenizer) -> str:
@@ -130,10 +140,15 @@ class PairedDataset(Dataset):
     `query_fields` selects which fields make up the query (comment) stream; a
     field listed there is *removed* from the video (K/V) stream unless
     `keep_kv_title` pins the title to both.
+
+    `with_hate=True` appends a 6th item: the row's `hate_speech` value mapped
+    through `HATE_MAP`, for the trainer's auxiliary loss. Only the aux train
+    loader asks for it; evaluation stays on the historical 5-tuple.
     """
 
     def __init__(self, df, tokenizer, comment_max_len: int = 128, video_max_len: int = 192,
-                 query_fields=('comment',), keep_kv_title: bool = False):
+                 query_fields=('comment',), keep_kv_title: bool = False,
+                 with_hate: bool = False):
         query_fields, video_fields = split_fields(query_fields, keep_kv_title)
         # Join with the tokenizer's real separator token, not config.SEP_TOKEN:
         # a literal "[SEP]" is 3-4 ordinary subwords to these tokenizers, so the
@@ -161,13 +176,25 @@ class PairedDataset(Dataset):
         assert_nonempty_masks('comment', self.comment_mask, comments)
         assert_nonempty_masks('video', self.video_mask, videos)
         self.labels = df['st_y'].astype(int).tolist()
+        self.with_hate = with_hate
+        if with_hate:
+            # Unseen label values fail here, at build time (same policy as the
+            # non-empty-mask guard): silently mapping garbage to a class would
+            # train the aux head against the wrong target for the whole run.
+            unknown = sorted(set(df['hate_speech']) - set(HATE_MAP))
+            if unknown:
+                raise ValueError(
+                    f'unknown hate_speech value(s) {unknown}; expected a subset of '
+                    f'{sorted(HATE_MAP)}')
+            self.hate_labels = [HATE_MAP[v] for v in df['hate_speech']]
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return (self.comment_ids[idx], self.comment_mask[idx],
+        item = (self.comment_ids[idx], self.comment_mask[idx],
                 self.video_ids[idx], self.video_mask[idx], self.labels[idx])
+        return item + (self.hate_labels[idx],) if self.with_hate else item
 
 
 def collate_paired(batch, pad_token_id: int):
@@ -179,11 +206,17 @@ def collate_paired(batch, pad_token_id: int):
     video_ids = torch.full((n, v_len), pad_token_id, dtype=torch.long)
     video_mask = torch.zeros((n, v_len), dtype=torch.long)
     labels = torch.tensor([b[4] for b in batch], dtype=torch.long)
-    for i, (cids, cmask, vids, vmask, _) in enumerate(batch):
+    for i, b in enumerate(batch):
+        cids, cmask, vids, vmask = b[:4]
         comment_ids[i, :len(cids)] = torch.tensor(cids)
         comment_mask[i, :len(cmask)] = torch.tensor(cmask)
         video_ids[i, :len(vids)] = torch.tensor(vids)
         video_mask[i, :len(vmask)] = torch.tensor(vmask)
+    # A 6th hate_speech tensor appears only when the dataset was built with
+    # `with_hate=True`, so the historical 5-tuple batches keep their exact shape.
+    if len(batch[0]) > 5:
+        hate = torch.tensor([b[5] for b in batch], dtype=torch.long)
+        return comment_ids, comment_mask, video_ids, video_mask, labels, hate
     return comment_ids, comment_mask, video_ids, video_mask, labels
 
 
@@ -206,7 +239,10 @@ def group_grad_norms(net):
 def collect(net, loader, device, criterion=None, use_amp: bool = False):
     net.eval()
     preds, probs, labels, losses = [], [], [], []
-    for cids, cmask, vids, vmask, label in loader:
+    for batch in loader:
+        # Tolerant of the optional 6th (hate_speech) element: evaluation scores
+        # the main labels only, and only the aux train loader emits 6-tuples.
+        cids, cmask, vids, vmask, label = batch[:5]
         with autocast_ctx(device, use_amp):
             logits = net(cids.to(device), cmask.to(device), vids.to(device), vmask.to(device))
             if criterion is not None:
@@ -228,8 +264,9 @@ def evaluate(net, loader, device, criterion=None, use_amp: bool = False):
 
 
 def make_loader(df, tokenizer, batch_size, comment_max_len, video_max_len, shuffle_sampler=None,
-                query_fields=('comment',), keep_kv_title: bool = False):
-    dataset = PairedDataset(df, tokenizer, comment_max_len, video_max_len, query_fields, keep_kv_title)
+                query_fields=('comment',), keep_kv_title: bool = False, with_hate: bool = False):
+    dataset = PairedDataset(df, tokenizer, comment_max_len, video_max_len, query_fields, keep_kv_title,
+                            with_hate=with_hate)
     pad = tokenizer.pad_token_id
     if shuffle_sampler is not None:
         lengths = [len(c) + len(v) for c, v in zip(dataset.comment_ids, dataset.video_ids)]
@@ -301,6 +338,12 @@ def parse_args(argv=None):
                         help='Std of the attention-pool query at init (default 0.02). The pool '
                              'starts near mean pooling; raise this to make it start sharper. '
                              'For the documented ablation change ONLY this, not the FFN.')
+    parser.add_argument('--hate-aux-weight', type=float, default=0.0,
+                        help='Weight of the auxiliary 3-way hate_speech CE on the pooled features '
+                             '(0 = off, the default). Training-time scaffold only: it shapes the '
+                             'trunk, inference reads the main head. Any value > 0 builds hate_head, '
+                             'so checkpoints trained with it need the same flag to load strictly '
+                             '(including --evaluate-only).')
     parser.add_argument('--val-fraction', type=float, default=VAL_FRACTION)
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--seed', type=int, default=SPLIT_SEED)
@@ -316,6 +359,8 @@ def parse_args(argv=None):
         args.history = os.path.splitext(args.out)[0] + '_history.csv'
     if args.heads <= 0 or args.layers <= 0:
         parser.error('--heads and --layers must be >= 1')
+    if args.hate_aux_weight < 0:
+        parser.error('--hate-aux-weight must be >= 0')
     fields = tuple(dict.fromkeys(f.strip().lower() for f in args.query_fields.split(',') if f.strip()))
     bad = [f for f in fields if f not in QUERY_CHOICES]
     if bad:
@@ -362,12 +407,18 @@ def main():
     unfreeze_epoch = args.freeze_epochs + 1 if args.freeze_epochs > 0 else None
     build_unfreeze = 0 if unfreeze_epoch is not None else args.unfreeze_layers
 
+    aux_weight = args.hate_aux_weight
     net = model_xattn.build_model(
         args.backbone, unfreeze_layers=build_unfreeze,
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
         use_pooled_v=args.pooled_v, separate_encoders=not args.shared_encoder,
         keep_frozen_dropout=args.keep_frozen_dropout, pool_init_scale=args.pool_init_scale,
+        hate_aux=aux_weight > 0,
     ).to(device)
+    if aux_weight > 0 and not net.hate_aux:
+        # Both derive from the same flag; this guards against a future caller
+        # wiring them apart (aux loss with no head to carry it).
+        raise RuntimeError('--hate-aux-weight > 0 but the model was built without hate_aux')
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
     encoders = 'separate' if net.separate_encoders else 'shared'
@@ -378,6 +429,9 @@ def main():
     print(f'  lr: backbone {args.backbone_lr:g} | xattn blocks {args.xattn_lr:g} '
           f'({sum(p.numel() for p in model_xattn.trainable_groups(net)[1])/1e6:.2f}M params) | '
           f'head {args.head_lr:g}')
+    aux_state = (f'ON (weight {aux_weight:g}, 3-way {{no, yes_implicit, yes_explicit}}, '
+                 f'train-time only)' if aux_weight > 0 else 'off')
+    print(f'  aux hate_speech head: {aux_state}')
     frozen_drop = 'ON (stochastic)' if args.keep_frozen_dropout else 'off (frozen blocks deterministic)'
     print(f'  frozen-block dropout: {frozen_drop}')
     if unfreeze_epoch is not None:
@@ -392,7 +446,8 @@ def main():
 
     train_loader = make_loader(df_train, tokenizer, args.batch_size,
                                args.max_len, args.video_max_len, shuffle_sampler=args.seed,
-                               query_fields=args.query_fields, keep_kv_title=args.keep_kv_title)
+                               query_fields=args.query_fields, keep_kv_title=args.keep_kv_title,
+                               with_hate=aux_weight > 0)
     val_loader = make_loader(df_val, tokenizer, args.batch_size, args.max_len, args.video_max_len,
                              query_fields=args.query_fields, keep_kv_title=args.keep_kv_title)
 
@@ -439,13 +494,28 @@ def main():
         # XAttnClassifier.train), so the frozen encoder blocks stay in eval()
         # even though train() just walked over them.
         net.train()
-        running_loss, seen = 0.0, 0
+        running_loss, running_main, running_aux, seen = 0.0, 0.0, 0.0, 0
         gnorm_sum, n_steps = np.zeros(3), 0
-        for cids, cmask, vids, vmask, label in train_loader:
+        n_batches = max(len(train_loader), 1)
+        for batch in train_loader:
+            # batch[:5] is the historical tuple; the 6th element (hate_speech
+            # labels) exists only when the aux loss is on.
+            cids, cmask, vids, vmask, label = batch[:5]
+            hate = batch[5] if len(batch) > 5 else None
+            if aux_weight > 0 and hate is None:
+                raise RuntimeError('aux loss requested but train batches carry no hate '
+                                   'labels (with_hate wiring broken)')
             optimizer.zero_grad()
             with autocast_ctx(device, use_amp):
-                logits = net(cids.to(device), cmask.to(device), vids.to(device), vmask.to(device))
-                loss = criterion(logits, label.to(device))
+                if aux_weight > 0:
+                    logits, aux_logits = net(cids.to(device), cmask.to(device),
+                                             vids.to(device), vmask.to(device), return_aux=True)
+                    loss_main = criterion(logits, label.to(device))
+                    loss_aux = criterion(aux_logits, hate.to(device))
+                    loss = loss_main + aux_weight * loss_aux
+                else:
+                    logits = net(cids.to(device), cmask.to(device), vids.to(device), vmask.to(device))
+                    loss_main = loss = criterion(logits, label.to(device))
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             gnorm_sum += np.array(group_grad_norms(net))
@@ -454,21 +524,29 @@ def main():
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item()
+            running_main += loss_main.item()
+            if aux_weight > 0:
+                running_aux += loss_aux.item()
             seen += label.size(0)
 
-        train_loss = running_loss / max(len(train_loader), 1)
+        train_loss = running_loss / n_batches
+        train_loss_main = running_main / n_batches
+        train_loss_aux = running_aux / n_batches if aux_weight > 0 else float('nan')
         gnorms = gnorm_sum / max(n_steps, 1)
         metrics = evaluate(net, val_loader, device, criterion, use_amp=use_amp)
         history.append({'epoch': epoch, 'train_loss': train_loss,
+                        'train_loss_main': train_loss_main, 'train_loss_aux': train_loss_aux,
                         'val_loss': metrics['loss'], 'val_macro_f1': metrics['macro_f1'],
                         'val_acc': metrics['acc'], 'seconds': round(time.time() - started, 1),
                         'gnorm_backbone': round(float(gnorms[0]), 4),
                         'gnorm_blocks': round(float(gnorms[1]), 4),
                         'gnorm_head': round(float(gnorms[2]), 4)})
+        aux_suffix = f' | aux_loss {train_loss_aux:.4f} (w {aux_weight:g})' if aux_weight > 0 else ''
         print(f"Epoch {epoch:>3}/{args.epochs} | train_loss {train_loss:.4f} | "
               f"val_loss {metrics['loss']:.4f} | val_macro_f1 {metrics['macro_f1']:.4f} | "
               f"val_acc {metrics['acc']:.4f} | {time.time() - started:.0f}s | "
-              f"gnorm enc {gnorms[0]:.2f} blk {gnorms[1]:.2f} head {gnorms[2]:.2f} (clip 1.0)")
+              f"gnorm enc {gnorms[0]:.2f} blk {gnorms[1]:.2f} head {gnorms[2]:.2f} (clip 1.0)"
+              f"{aux_suffix}")
 
         if metrics['macro_f1'] > best_score + 1e-4:
             best_score = metrics['macro_f1']

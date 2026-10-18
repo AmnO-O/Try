@@ -48,6 +48,14 @@ the towers can only diverge in the `unfreeze_last_n` blocks. Set
 `separate_encoders=False` (trainer: `--shared-encoder`) to go back to one shared
 encoder, which roughly halves the parameter count.
 
+`hate_aux=True` adds a second readout on the same pooled vector: a 3-way
+classifier over `hate_speech` ({no, yes_implicit, yes_explicit}). It is a
+training-time scaffold (trainer: `--hate-aux-weight`): the extra CE term pushes
+the shared trunk to expose "hate" as its own axis instead of letting the
+stereotype decision lean on a hate-tone proxy. Inference reads the main head
+only, and with the default `hate_aux=False` no `hate_head` module exists at all,
+so existing checkpoints and the recorded rebuild recipe are untouched.
+
 **Nothing is cached.** `forward()` always runs both towers, so a video that
 appears in several rows is re-encoded on every row, and a shared encoder does not
 change that by itself - a cache also needs the *video* weights to be stationary.
@@ -283,6 +291,7 @@ class XAttnClassifier(nn.Module):
         separate_encoders: bool = True,
         keep_frozen_dropout: bool = False,
         pool_init_scale: float = 0.02,
+        hate_aux: bool = False,
     ):
         super().__init__()
         self.encoder = load_encoder(backbone)
@@ -327,6 +336,18 @@ class XAttnClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(head_in, num_classes),
         )
+        # Optional auxiliary head on the same pooled vector (see module
+        # docstring): a 3-way `hate_speech` readout used only by the trainer's
+        # aux loss. Constructed only when asked for, so `hate_aux=False`
+        # (default) keeps state dicts identical to every model trained before
+        # this flag existed.
+        self.hate_aux = hate_aux
+        if hate_aux:
+            self.hate_head = nn.Sequential(
+                nn.LayerNorm(head_in),
+                nn.Dropout(dropout),
+                nn.Linear(head_in, 3),
+            )
 
     def train(self, mode: bool = True):
         """`train(True)` also re-applies the frozen-module invariant.
@@ -408,7 +429,7 @@ class XAttnClassifier(nn.Module):
                 f'answers with zeros and the need_weights=True diagnostic path with NaN.')
 
     def forward(self, comment_ids, comment_mask, video_ids, video_mask,
-                return_attn: bool = False):
+                return_attn: bool = False, return_aux: bool = False):
         # Before the video encoder or any cross-attention: an all-padded video row
         # has no valid key, and the diagnostic path turns that into NaN.
         self._validate_video_mask(video_mask)
@@ -457,6 +478,14 @@ class XAttnClassifier(nn.Module):
             features = pooled_c
 
         logits = self.head(features)
+        if return_aux:
+            # Training-only branch: the auxiliary `hate_speech` readout on the
+            # same pooled vector. Not combined with the attention dump.
+            if return_attn:
+                raise ValueError('return_aux and return_attn are not combined')
+            if not self.hate_aux:
+                raise RuntimeError('return_aux=True but the model was built without hate_aux')
+            return logits, self.hate_head(features)
         if not return_attn:
             return logits
         # Diagnostics only: hand back the two pooled vectors so a pooled-v
@@ -502,8 +531,9 @@ def trainable_groups(net: XAttnClassifier):
       nowhere near the head's: with AdamW the per-step move is ~LR regardless of
       gradient scale, so a freshly initialised block (weights ~N(0, 0.02)) fed
       lr 1e-3 moves ~5% of its own weight scale every step;
-    - **head** - `LayerNorm + Linear(d, 2)` plus the pooling query, a handful of
-      parameters that happily take 1e-3.
+    - **head** - `LayerNorm + Linear(d, 2)` plus the pooling query (and, when
+      built, the auxiliary hate_speech head), a handful of parameters that
+      happily take 1e-3.
 
     The blocks used to be lumped in with the head (anything not under
     `ENCODER_PREFIXES`), i.e. the whole 5.33M-parameter attention stack was
