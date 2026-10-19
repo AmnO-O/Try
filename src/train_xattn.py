@@ -220,6 +220,37 @@ def collate_paired(batch, pad_token_id: int):
     return comment_ids, comment_mask, video_ids, video_mask, labels
 
 
+def drop_video_context(video_ids, video_mask, pad_id: int, cls_id: int, sep_id: int,
+                       p: float, generator=None):
+    """Blank the whole video stream for a random fraction of rows (train only).
+
+    The model refuses an all-padding video row (it has no finite attention key),
+    so a dropped row keeps exactly the two tokens an empty title+description
+    tokenises to: [CLS] [SEP]. Everything else is padding. Cross-attention then
+    reads content-free keys, which forces the comment tower to carry the
+    decision instead of leaning on the video prior.
+
+    Returns the inputs unchanged when `p == 0`, so a baseline run consumes the
+    same RNG stream and stays bit-identical to the pre-flag code.
+    """
+    if p <= 0:
+        return video_ids, video_mask
+    keep = torch.rand(video_ids.size(0), generator=generator) >= p
+    if bool(keep.all()):
+        return video_ids, video_mask
+    video_ids = video_ids.clone()
+    video_mask = video_mask.clone()
+    drop = ~keep
+    video_ids[drop] = pad_id
+    video_ids[drop, 0] = cls_id
+    video_mask[drop] = 0
+    video_mask[drop, 0] = 1
+    if video_ids.size(1) >= 2:
+        video_ids[drop, 1] = sep_id
+        video_mask[drop, 1] = 1
+    return video_ids, video_mask
+
+
 def group_grad_norms(net):
     """Pre-clip gradient norms for (backbone, blocks, head).
 
@@ -285,6 +316,11 @@ def parse_args(argv=None):
     parser.add_argument('--label-column', default='stereotype')
     parser.add_argument('--max-len', type=int, default=160, help='Comment max tokens')
     parser.add_argument('--video-max-len', type=int, default=256, help='Title+description max tokens (all videos fit)')
+    parser.add_argument('--context-dropout', type=float, default=0.0,
+                        help='Probability of blanking a training row video stream to [CLS] [SEP] '
+                             '(0 = off, the default). Train-only modality dropout: the comment must '
+                             'carry the decision, while validation/inference still see the context. '
+                             'Applied per row, before the batch reaches the device.')
     parser.add_argument('--query-fields', default='comment',
                         help='Comma-separated fields placed in the query/comment stream '
                              f'(choices: {", ".join(QUERY_CHOICES)}). A listed field is removed from '
@@ -361,6 +397,8 @@ def parse_args(argv=None):
         parser.error('--heads and --layers must be >= 1')
     if args.hate_aux_weight < 0:
         parser.error('--hate-aux-weight must be >= 0')
+    if not 0.0 <= args.context_dropout <= 1.0:
+        parser.error('--context-dropout must be in [0, 1]')
     fields = tuple(dict.fromkeys(f.strip().lower() for f in args.query_fields.split(',') if f.strip()))
     bad = [f for f in fields if f not in QUERY_CHOICES]
     if bad:
@@ -374,6 +412,8 @@ def parse_args(argv=None):
 def main():
     args = parse_args()
     set_seed(args.seed)
+    ctx_gen = (torch.Generator().manual_seed(args.seed * 1009 + 17)
+               if args.context_dropout > 0 else None)
     device = resolve_device(args.device)
     use_amp = not args.no_amp and device.type == 'cuda'
     print(f'Device: {device} | backbone: {args.backbone} | '
@@ -400,6 +440,9 @@ def main():
     sep = sep_for(tokenizer)
     print(f'  query stream: {f" {sep} ".join(query_fields)} | '
           f'K/V stream: {f" {sep} ".join(video_fields) or "(none)"}')
+    ctx_state = (f'ON p={args.context_dropout:g} (train only; dropped rows -> [CLS] [SEP])'
+                 if args.context_dropout > 0 else 'off')
+    print(f'  context dropout: {ctx_state}')
 
     # Two-phase: phase 1 keeps the encoder frozen so the decoder stack and
     # head settle against stationary features; phase 2 (epoch freeze_epochs+1)
@@ -502,6 +545,12 @@ def main():
             # labels) exists only when the aux loss is on.
             cids, cmask, vids, vmask, label = batch[:5]
             hate = batch[5] if len(batch) > 5 else None
+            if args.context_dropout > 0:
+                vids, vmask = drop_video_context(
+                    vids, vmask, tokenizer.pad_token_id,
+                    tokenizer.cls_token_id or tokenizer.pad_token_id,
+                    tokenizer.sep_token_id or tokenizer.pad_token_id,
+                    args.context_dropout, ctx_gen)
             if aux_weight > 0 and hate is None:
                 raise RuntimeError('aux loss requested but train batches carry no hate '
                                    'labels (with_hate wiring broken)')
