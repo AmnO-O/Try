@@ -358,23 +358,35 @@ def class_weights_for(labels, mode: str):
     return counts, weights
 
 
-def load_warm_start(net, path: str, device):
-    """Initialize from a Task A xattn checkpoint, keeping the 3-way head fresh.
+def load_warm_start(net, path: str, device, scope: str = 'all'):
+    """Initialize from a Task A xattn checkpoint.
 
-    A Task A checkpoint has a 2-way `head.2`; the Task B model has a 3-way one.
-    Drop only `head.*` (and any auxiliary `hate_head.*` source tensors), then
-    require every remaining target tensor to load. A silent architecture
-    mismatch here would otherwise train a partly random encoder.
+    `scope='all'` transfers encoder, decoder blocks and pool query, dropping the
+    old 2-way head: this is the shared-decoder warm start. `scope='encoder'`
+    keeps only `encoder.*`, leaving the Task B decoder, pool query and 3-way head
+    fresh: this tests a separate decoder on top of the Task A representation.
+
+    A silent architecture mismatch here would otherwise train a partly random
+    encoder, so every target tensor that should have been loaded is required.
     """
     state = torch.load(path, map_location=device)
-    dropped = [k for k in list(state) if k.startswith(('head.', 'hate_head.'))]
+    if scope == 'encoder':
+        dropped = [k for k in list(state) if not k.startswith('encoder.')]
+    elif scope == 'all':
+        dropped = [k for k in list(state) if k.startswith(('head.', 'hate_head.'))]
+    else:
+        raise ValueError(f'unknown warm-start scope: {scope!r}')
     for key in dropped:
         del state[key]
     missing, unexpected = net.load_state_dict(state, strict=False)
-    bad_missing = [k for k in missing if not k.startswith('head.')]
+    if scope == 'encoder':
+        # A fresh decoder/head/pool is intentional, not a mismatch.
+        bad_missing = [k for k in missing if k.startswith('encoder.')]
+    else:
+        bad_missing = [k for k in missing if not k.startswith('head.')]
     if bad_missing or unexpected:
         raise RuntimeError(
-            f'warm start from {path} does not match the target architecture: '
+            f'warm start from {path} ({scope}) does not match the target architecture: '
             f'missing={bad_missing[:5]} unexpected={unexpected[:5]}'
         )
     return len(dropped)
@@ -411,6 +423,10 @@ def parse_args(argv=None):
                         help='Task B only: initialize from a Task A xattn checkpoint. The 2-way '
                              'Task A head is discarded and the new 3-way head is trained from '
                              'scratch; encoder, decoder blocks and pool query are transferred.')
+    parser.add_argument('--init-scope', choices=('all', 'encoder'), default='all',
+                        help="With --init-from: 'all' transfers encoder + decoder blocks + pool "
+                             "query (shared-decoder warm start); 'encoder' keeps only encoder.* and "
+                             "leaves a fresh Task B decoder, pool query and 3-way head.")
     parser.add_argument('--class-weighting', choices=('none', 'inverse', 'sqrt'), default='none',
                         help='Task B only: class-weighted CE computed from the train split. '
                              'inverse = N/(K*n_c); sqrt = a milder inverse-frequency weighting. '
@@ -598,9 +614,9 @@ def main():
         hate_aux=aux_weight > 0, num_classes=args.num_classes,
     )
     if args.init_from:
-        dropped = load_warm_start(net, args.init_from, device)
-        print(f'  warm start: {args.init_from} | dropped {dropped} head tensor(s); '
-              f'3-way head starts fresh')
+        dropped = load_warm_start(net, args.init_from, device, args.init_scope)
+        print(f'  warm start ({args.init_scope}): {args.init_from} | dropped {dropped} tensor(s); '
+              f'{"3-way head starts fresh" if args.init_scope == "all" else "decoder + head start fresh"}')
     net = net.to(device)
     if aux_weight > 0 and not net.hate_aux:
         # Both derive from the same flag; this guards against a future caller
