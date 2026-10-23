@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Data loading and torch Dataset for Task A (stereotype detection).
+"""Data loading and torch Dataset for the StereoQueerEval tasks.
 
-Every input is rendered into an MLM prompt that ends in a [MASK] slot, so the
-model predicts the label word ('yes' / 'no') rather than reading a classifier
-logit off an arbitrary projection.
+Task A (default) renders every input into an MLM prompt that ends in a [MASK]
+slot, so the model predicts the label word ('yes' / 'no'). Task B keeps the
+three-way hate-speech target {no, yes_implicit, yes_explicit} via
+`label_mode='hate3'`.
 """
 
 import csv
@@ -42,6 +43,24 @@ def encode_stereotype(label: str) -> int:
     if value not in CLASS_TO_ID:
         raise ValueError(f"Unknown stereotype label: {label!r} (expected 'yes' or 'no')")
     return CLASS_TO_ID[value]
+
+
+# Task B keeps the three hate_speech values apart. `none` is accepted because
+# auxiliary files use it; the StereoQueerEval training TSVs spell the negative
+# class `no`.
+HATE_TYPE_TO_ID = {'no': 0, 'none': 0, 'yes_implicit': 1, 'yes_explicit': 2}
+HATE_TYPE_CLASSES = ('no', 'yes_implicit', 'yes_explicit')
+
+
+def encode_hate_type(label: str) -> int:
+    """Task B: 'no'/'none' -> 0, 'yes_implicit' -> 1, 'yes_explicit' -> 2."""
+    value = str(label).strip().lower()
+    if value not in HATE_TYPE_TO_ID:
+        raise ValueError(
+            f"Unknown hate_speech label: {label!r} "
+            f"(expected one of {sorted(HATE_TYPE_TO_ID)})"
+        )
+    return HATE_TYPE_TO_ID[value]
 
 
 def encode_label(value: str, column: str = 'stereotype') -> int:
@@ -161,17 +180,24 @@ def _read_tsv(path: str) -> pd.DataFrame:
 
 
 def _add_features(df: pd.DataFrame, lang: str, max_len: int = MAX_LEN,
-                  label_column: str = 'stereotype') -> pd.DataFrame:
+                  label_column: str = 'stereotype', label_mode: str = 'binary') -> pd.DataFrame:
     budget = PromptBudget(max_len=max_len)
     if label_column not in REQUIRED_COLUMNS:
         raise ValueError(f'label_column must be one of {REQUIRED_COLUMNS}, got {label_column!r}')
+    if label_mode not in ('binary', 'hate3'):
+        raise ValueError(f"label_mode must be 'binary' or 'hate3', got {label_mode!r}")
+    if label_mode == 'hate3' and label_column != 'hate_speech':
+        raise ValueError("label_mode='hate3' requires label_column='hate_speech'")
     df['lang'] = lang
     df['context'] = [
         build_context(c, t, d)
         for c, t, d in zip(df['yt_comment'], df['yt_title'], df['yt_description'])
     ]
     df['prompt'] = [render_prompt(row, lang, budget) for _, row in df.iterrows()]
-    df['st_y'] = [encode_label(s, label_column) for s in df[label_column]]
+    if label_mode == 'hate3':
+        df['st_y'] = [encode_hate_type(s) for s in df['hate_speech']]
+    else:
+        df['st_y'] = [encode_label(s, label_column) for s in df[label_column]]
     return df
 
 
@@ -190,8 +216,15 @@ def load_frame(
     languages: Optional[List[str]] = None,
     max_len: int = MAX_LEN,
     label_column: str = 'stereotype',
+    label_mode: str = 'binary',
 ) -> pd.DataFrame:
-    """Reads every language TSV into one frame with prompts and encoded labels."""
+    """Reads every language TSV into one frame with prompts and encoded labels.
+
+    `label_mode='binary'` keeps the historical Task A target. `label_mode='hate3'`
+    reads the three-way Task B target from `hate_speech` (0=no, 1=implicit,
+    2=explicit) and requires `label_column='hate_speech'` so a caller cannot
+    silently train a 3-class head on the wrong column.
+    """
     frames = []
     for path in find_data_files(data_dir):
         match = re.search(r'_([A-Z]{2})_training\.tsv$', os.path.basename(path))
@@ -200,7 +233,8 @@ def load_frame(
         lang = match.group(1)
         if languages and lang not in languages:
             continue
-        frames.append(_add_features(_read_tsv(path), lang, max_len, label_column=label_column))
+        frames.append(_add_features(_read_tsv(path), lang, max_len,
+                                    label_column=label_column, label_mode=label_mode))
 
     if not frames:
         raise ValueError('No language files matched the requested languages.')
@@ -208,11 +242,12 @@ def load_frame(
 
 
 def load_frame_from_file(path: str, max_len: int = MAX_LEN,
-                         label_column: str = 'stereotype') -> pd.DataFrame:
+                         label_column: str = 'stereotype',
+                         label_mode: str = 'binary') -> pd.DataFrame:
     """Same encoding as load_frame but for a single explicit TSV path."""
     match = re.search(r'_([A-Z]{2})(?:_training|_clean|_development)?\.tsv$', os.path.basename(path))
     return _add_features(_read_tsv(path), match.group(1) if match else 'EN', max_len,
-                         label_column=label_column)
+                         label_column=label_column, label_mode=label_mode)
 
 
 def split_by_video(

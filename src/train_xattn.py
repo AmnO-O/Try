@@ -25,6 +25,9 @@ Usage:
                                                             # + train-time 3-way hate_speech aux CE
                                                             # on the same pooled vector (inference
                                                             # reads the main head only)
+    python src/train_xattn.py --task b --out weights/TaskB_s42.pt
+                                                            # Task B: same architecture, main head
+                                                            # 3-way over {no, implicit, explicit}
 """
 
 import argparse
@@ -72,7 +75,8 @@ QUERY_CHOICES = ('comment', 'title')
 # scaffold on the same pooled vector (see model_xattn's module docstring). The
 # corpus carries the ordinal hate scale {no, yes_implicit, yes_explicit}; a 3-way
 # head keeps the implicit/explicit distinction that a binary collapse would lose.
-HATE_MAP = {'no': 0, 'yes_implicit': 1, 'yes_explicit': 2}
+# Task B uses the same mapping for its *main* head (`--task b`).
+HATE_MAP = data_mod.HATE_TYPE_TO_ID
 
 
 def sep_for(tokenizer) -> str:
@@ -289,9 +293,44 @@ def collect(net, loader, device, criterion=None, use_amp: bool = False):
     }
 
 
-def evaluate(net, loader, device, criterion=None, use_amp: bool = False):
+def evaluate(net, loader, device, criterion=None, use_amp: bool = False, task: str = 'a'):
     out = collect(net, loader, device, criterion, use_amp=use_amp)
+    if task == 'b':
+        return metrics_from_taskb(out['preds'], out['labels'], out['loss'])
     return metrics_from(out['preds'], out['labels'], out['loss'])
+
+
+def metrics_from_taskb(preds, labels, loss=float('nan')):
+    """Task B metrics: 3-class macro-F1 plus one scalar F1 per class.
+
+    Keep the values scalar (no per-class list) so the shared `print_metrics`
+    formatter can print the dict unchanged.
+    """
+    from sklearn.metrics import accuracy_score, f1_score
+
+    per_class = f1_score(labels, preds, labels=[0, 1, 2], average=None, zero_division=0)
+    return {
+        'loss': loss,
+        'acc': accuracy_score(labels, preds),
+        'macro_f1': f1_score(labels, preds, labels=[0, 1, 2], average='macro', zero_division=0),
+        'f1_no': float(per_class[0]),
+        'f1_implicit': float(per_class[1]),
+        'f1_explicit': float(per_class[2]),
+    }
+
+
+def format_confusion_matrix_taskb(labels, preds):
+    """3x3 matrix as text, rows = truth, columns = prediction."""
+    from sklearn.metrics import confusion_matrix
+
+    cm = confusion_matrix(labels, preds, labels=[0, 1, 2])
+    names = ('no', 'implicit', 'explicit')
+    header = '              ' + ' '.join(f'{("pred " + n):>14}' for n in names)
+    lines = [header]
+    for i, name in enumerate(names):
+        cells = ' '.join(f'{int(cm[i, j]):>14}' for j in range(3))
+        lines.append(f'  true {name:<8} {cells}')
+    return '\n'.join(lines)
 
 
 def make_loader(df, tokenizer, batch_size, comment_max_len, video_max_len, shuffle_sampler=None,
@@ -312,8 +351,15 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--backbone', default=model_xattn.DEFAULT_BACKBONE)
+    parser.add_argument('--task', choices=('a', 'b'), default='a',
+                        help="a = binary stereotype (default); b = 3-class hate-speech type "
+                             "from hate_speech {no, yes_implicit, yes_explicit}. Task B uses the "
+                             "same architecture and recipe; only the label mapping and head "
+                             "output dimension change.")
     parser.add_argument('--languages', nargs='*', default=None, help='Subset of EN/IT/NL (default: all)')
-    parser.add_argument('--label-column', default='stereotype')
+    parser.add_argument('--label-column', default=None,
+                        help="Label column for the main head. Defaults to 'stereotype' for --task a "
+                             "and is forced to 'hate_speech' for --task b.")
     parser.add_argument('--max-len', type=int, default=160, help='Comment max tokens')
     parser.add_argument('--video-max-len', type=int, default=256, help='Title+description max tokens (all videos fit)')
     parser.add_argument('--context-dropout', type=float, default=0.0,
@@ -384,13 +430,39 @@ def parse_args(argv=None):
     parser.add_argument('--split-seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--seed', type=int, default=SPLIT_SEED)
     parser.add_argument('--device', default=None, help='cuda | cpu (default: auto)')
-    parser.add_argument('--out', default=os.path.join(WEIGHTS_DIR, 'best_xattn_stereotype.pt'))
+    parser.add_argument('--out', default=None,
+                        help='Checkpoint path (default: best_xattn_stereotype.pt for --task a, '
+                             'best_xattn_taskb.pt for --task b)')
     parser.add_argument('--history', default=None)
+    parser.add_argument('--probs-out', default=None,
+                        help='Optional .npy path for the best checkpoint held-out probabilities '
+                             '(rows x classes), used by the seed-ensemble analysis.')
     parser.add_argument('--no-amp', action='store_true')
     parser.add_argument('--evaluate-only', action='store_true')
     parser.add_argument('--train-extras', default=None,
                         help='Comma-separated TSVs appended to the TRAIN split only (val unchanged)')
     args = parser.parse_args(argv)
+    if args.task == 'b':
+        args.label_column = 'hate_speech'
+        args.label_mode = 'hate3'
+        args.num_classes = 3
+        if args.hate_aux_weight > 0:
+            parser.error('--hate-aux-weight is for Task A; --task b already trains the 3-way '
+                         'hate head as the main objective')
+    else:
+        if args.label_column is None:
+            args.label_column = 'stereotype'
+        args.label_mode = 'binary'
+        args.num_classes = 2
+        if args.label_column == 'hate_speech':
+            # Preserve the old auxiliary-binary behaviour, but make it explicit:
+            # a 2-way head on hate_speech is Task A's binary concept, not Task B.
+            args.label_mode = 'binary'
+    if args.out is None:
+        args.out = os.path.join(
+            WEIGHTS_DIR,
+            'best_xattn_taskb.pt' if args.task == 'b' else 'best_xattn_stereotype.pt',
+        )
     if args.history is None:
         args.history = os.path.splitext(args.out)[0] + '_history.csv'
     if args.heads <= 0 or args.layers <= 0:
@@ -419,14 +491,22 @@ def main():
     print(f'Device: {device} | backbone: {args.backbone} | '
           f'mixed precision: {"ON (fp16)" if use_amp else "off"}')
 
-    df_all = data_mod.load_frame(languages=args.languages, label_column=args.label_column)
+    df_all = data_mod.load_frame(languages=args.languages, label_column=args.label_column,
+                                 label_mode=args.label_mode)
     df_train, df_val = data_mod.split_by_video(df_all, args.val_fraction, args.split_seed)
     if args.train_extras:
-        extras = [data_mod.load_frame_from_file(f.strip(), label_column=args.label_column)
+        extras = [data_mod.load_frame_from_file(f.strip(), label_column=args.label_column,
+                                                label_mode=args.label_mode)
                   for f in args.train_extras.split(',') if f.strip()]
         df_train = pd.concat([df_train, *extras], ignore_index=True)
         print(f'Train extras: +{sum(len(e) for e in extras)} rows (total train {len(df_train)})')
 
+    task_name = 'Task B (3-class hate speech)' if args.task == 'b' else 'Task A (binary stereotype)'
+    print(f'Task: {task_name} | label column: {args.label_column} | '
+          f'label mode: {args.label_mode} | classes: {args.num_classes}')
+    if args.task == 'b':
+        print(f'  class counts train: {df_train["st_y"].value_counts().sort_index().to_dict()} | '
+              f'val: {df_val["st_y"].value_counts().sort_index().to_dict()}')
     print(f'Train {len(df_train)} | val {len(df_val)} (val-fraction {args.val_fraction}, '
           f'split-seed {args.split_seed})')
     query_fields, video_fields = split_fields(args.query_fields, args.keep_kv_title)
@@ -456,7 +536,7 @@ def main():
         heads=args.heads, layers=args.layers, dropout=args.dropout, ffn_mult=args.ffn_mult,
         use_pooled_v=args.pooled_v, separate_encoders=not args.shared_encoder,
         keep_frozen_dropout=args.keep_frozen_dropout, pool_init_scale=args.pool_init_scale,
-        hate_aux=aux_weight > 0,
+        hate_aux=aux_weight > 0, num_classes=args.num_classes,
     ).to(device)
     if aux_weight > 0 and not net.hate_aux:
         # Both derive from the same flag; this guards against a future caller
@@ -496,8 +576,12 @@ def main():
 
     if args.evaluate_only:
         net.load_state_dict(torch.load(args.out, map_location=device))
-        print_metrics(evaluate(net, val_loader, device, use_amp=use_amp),
+        print_metrics(evaluate(net, val_loader, device, use_amp=use_amp, task=args.task),
                       f'VALIDATION (loaded {args.out})')
+        if args.task == 'b':
+            out = collect(net, val_loader, device, use_amp=use_amp)
+            print('--- CONFUSION MATRIX ---')
+            print(format_confusion_matrix_taskb(out['labels'], out['preds']))
         return
 
     backbone_params, block_params, head_params = model_xattn.trainable_groups(net)
@@ -582,7 +666,7 @@ def main():
         train_loss_main = running_main / n_batches
         train_loss_aux = running_aux / n_batches if aux_weight > 0 else float('nan')
         gnorms = gnorm_sum / max(n_steps, 1)
-        metrics = evaluate(net, val_loader, device, criterion, use_amp=use_amp)
+        metrics = evaluate(net, val_loader, device, criterion, use_amp=use_amp, task=args.task)
         history.append({'epoch': epoch, 'train_loss': train_loss,
                         'train_loss_main': train_loss_main, 'train_loss_aux': train_loss_aux,
                         'val_loss': metrics['loss'], 'val_macro_f1': metrics['macro_f1'],
@@ -612,11 +696,17 @@ def main():
     print(f'\nWrote {len(history)} epoch(s) of metrics to {args.history}')
 
     net.load_state_dict(torch.load(args.out, map_location=device))
-    print_metrics(evaluate(net, val_loader, device, criterion, use_amp=use_amp),
+    print_metrics(evaluate(net, val_loader, device, criterion, use_amp=use_amp, task=args.task),
                   'VALIDATION (best checkpoint)')
     best = collect(net, val_loader, device, criterion, use_amp=use_amp)
+    if args.probs_out:
+        np.save(args.probs_out, best['probs'])
+        print(f'Wrote held-out probabilities to {args.probs_out} ({best["probs"].shape})')
     print('--- CONFUSION MATRIX (best checkpoint) ---')
-    print(format_confusion_matrix(best['labels'], best['preds']))
+    if args.task == 'b':
+        print(format_confusion_matrix_taskb(best['labels'], best['preds']))
+    else:
+        print(format_confusion_matrix(best['labels'], best['preds']))
 
     print('--- PER LANGUAGE ---')
     for lang in sorted(df_val['lang'].unique()):
@@ -624,9 +714,13 @@ def main():
         loader = make_loader(subset, tokenizer, args.batch_size, args.max_len, args.video_max_len,
                              query_fields=args.query_fields, keep_kv_title=args.keep_kv_title)
         out = collect(net, loader, device, use_amp=use_amp)
-        m = metrics_from(out['preds'], out['labels'])
+        m = metrics_from_taskb(out['preds'], out['labels']) if args.task == 'b' \
+            else metrics_from(out['preds'], out['labels'])
         print(f"  [{lang}] acc {m['acc']:.4f} | macro_f1 {m['macro_f1']:.4f}")
-        print(format_confusion_matrix(out['labels'], out['preds']))
+        if args.task == 'b':
+            print(format_confusion_matrix_taskb(out['labels'], out['preds']))
+        else:
+            print(format_confusion_matrix(out['labels'], out['preds']))
 
 
 if __name__ == '__main__':
