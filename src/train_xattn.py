@@ -28,6 +28,11 @@ Usage:
     python src/train_xattn.py --task b --out weights/TaskB_s42.pt
                                                             # Task B: same architecture, main head
                                                             # 3-way over {no, implicit, explicit}
+    python src/train_xattn.py --task b --init-from weights/best_xattn_stereotype.pt \
+        --class-weighting sqrt --out weights/TaskB_warm_s42.pt
+                                                            # warm-start from Task A; the old
+                                                            # 2-way head is replaced, the rest
+                                                            # transfers, then fine-tune
 """
 
 import argparse
@@ -333,6 +338,48 @@ def format_confusion_matrix_taskb(labels, preds):
     return '\n'.join(lines)
 
 
+def class_weights_for(labels, mode: str):
+    """Compute normalized class weights from the TRAIN split only.
+
+    `inverse` is the usual N/(K*n_c); `sqrt` is a deliberately milder
+    inverse-frequency weighting. Both are normalized to mean 1, so the overall
+    loss scale stays comparable to plain CE.
+    """
+    counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=3).astype(np.float64)
+    if (counts == 0).any():
+        raise ValueError(f'class weight mode {mode!r} needs all 3 classes in train; got {counts.tolist()}')
+    if mode == 'inverse':
+        weights = counts.sum() / (len(counts) * counts)
+    elif mode == 'sqrt':
+        weights = 1.0 / np.sqrt(counts)
+        weights *= len(counts) / weights.sum()
+    else:
+        raise ValueError(f'unknown class weighting mode: {mode!r}')
+    return counts, weights
+
+
+def load_warm_start(net, path: str, device):
+    """Initialize from a Task A xattn checkpoint, keeping the 3-way head fresh.
+
+    A Task A checkpoint has a 2-way `head.2`; the Task B model has a 3-way one.
+    Drop only `head.*` (and any auxiliary `hate_head.*` source tensors), then
+    require every remaining target tensor to load. A silent architecture
+    mismatch here would otherwise train a partly random encoder.
+    """
+    state = torch.load(path, map_location=device)
+    dropped = [k for k in list(state) if k.startswith(('head.', 'hate_head.'))]
+    for key in dropped:
+        del state[key]
+    missing, unexpected = net.load_state_dict(state, strict=False)
+    bad_missing = [k for k in missing if not k.startswith('head.')]
+    if bad_missing or unexpected:
+        raise RuntimeError(
+            f'warm start from {path} does not match the target architecture: '
+            f'missing={bad_missing[:5]} unexpected={unexpected[:5]}'
+        )
+    return len(dropped)
+
+
 def make_loader(df, tokenizer, batch_size, comment_max_len, video_max_len, shuffle_sampler=None,
                 query_fields=('comment',), keep_kv_title: bool = False, with_hate: bool = False):
     dataset = PairedDataset(df, tokenizer, comment_max_len, video_max_len, query_fields, keep_kv_title,
@@ -360,6 +407,14 @@ def parse_args(argv=None):
     parser.add_argument('--label-column', default=None,
                         help="Label column for the main head. Defaults to 'stereotype' for --task a "
                              "and is forced to 'hate_speech' for --task b.")
+    parser.add_argument('--init-from', default=None,
+                        help='Task B only: initialize from a Task A xattn checkpoint. The 2-way '
+                             'Task A head is discarded and the new 3-way head is trained from '
+                             'scratch; encoder, decoder blocks and pool query are transferred.')
+    parser.add_argument('--class-weighting', choices=('none', 'inverse', 'sqrt'), default='none',
+                        help='Task B only: class-weighted CE computed from the train split. '
+                             'inverse = N/(K*n_c); sqrt = a milder inverse-frequency weighting. '
+                             'Both are normalized to mean weight 1. Default: none.')
     parser.add_argument('--max-len', type=int, default=160, help='Comment max tokens')
     parser.add_argument('--video-max-len', type=int, default=256, help='Title+description max tokens (all videos fit)')
     parser.add_argument('--context-dropout', type=float, default=0.0,
@@ -463,6 +518,10 @@ def parse_args(argv=None):
             WEIGHTS_DIR,
             'best_xattn_taskb.pt' if args.task == 'b' else 'best_xattn_stereotype.pt',
         )
+    if args.init_from and args.task != 'b':
+        parser.error('--init-from is for --task b only (Task A warm starts are not implemented)')
+    if args.class_weighting != 'none' and args.task != 'b':
+        parser.error('--class-weighting is for --task b only')
     if args.history is None:
         args.history = os.path.splitext(args.out)[0] + '_history.csv'
     if args.heads <= 0 or args.layers <= 0:
@@ -537,7 +596,12 @@ def main():
         use_pooled_v=args.pooled_v, separate_encoders=not args.shared_encoder,
         keep_frozen_dropout=args.keep_frozen_dropout, pool_init_scale=args.pool_init_scale,
         hate_aux=aux_weight > 0, num_classes=args.num_classes,
-    ).to(device)
+    )
+    if args.init_from:
+        dropped = load_warm_start(net, args.init_from, device)
+        print(f'  warm start: {args.init_from} | dropped {dropped} head tensor(s); '
+              f'3-way head starts fresh')
+    net = net.to(device)
     if aux_weight > 0 and not net.hate_aux:
         # Both derive from the same flag; this guards against a future caller
         # wiring them apart (aux loss with no head to carry it).
@@ -591,7 +655,13 @@ def main():
     if backbone_params:
         groups.append({'params': backbone_params, 'lr': args.backbone_lr})
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
+    class_weight_tensor = None
+    if args.class_weighting != 'none':
+        counts, weights = class_weights_for(df_train['st_y'].to_numpy(), args.class_weighting)
+        class_weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
+        print(f'  class-weighted CE ({args.class_weighting}): counts {counts.astype(int).tolist()} '
+              f'-> weights {[round(float(w), 4) for w in weights]}')
+    criterion = nn.CrossEntropyLoss(weight=class_weight_tensor)
     scaler = make_scaler(use_amp)
 
     best_score, epochs_no_improve, history = -1.0, 0, []
