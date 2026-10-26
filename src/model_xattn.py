@@ -460,7 +460,7 @@ class XAttnClassifier(nn.Module):
                 f'answers with zeros and the need_weights=True diagnostic path with NaN.')
 
     def forward(self, comment_ids, comment_mask, video_ids, video_mask,
-                knowledge=None, return_attn: bool = False, return_aux: bool = False):
+                return_attn: bool = False, return_aux: bool = False, knowledge=None):
         # Before the video encoder or any cross-attention: an all-padded video row
         # has no valid key, and the diagnostic path turns that into NaN.
         self._validate_video_mask(video_mask)
