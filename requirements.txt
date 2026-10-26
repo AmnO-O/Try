@@ -15,3 +15,5 @@ evaluate==0.4.6
 scikit-learn==1.9.0
 # NLLB tokenizer for augment_nllb.py / augment_roundtrip.py (gated model)
 sentencepiece
+# KIM lexical knowledge (WordNet + Open Multilingual WordNet); downloaded at runtime
+nltk

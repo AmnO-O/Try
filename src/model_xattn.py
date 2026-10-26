@@ -292,6 +292,8 @@ class XAttnClassifier(nn.Module):
         keep_frozen_dropout: bool = False,
         pool_init_scale: float = 0.02,
         hate_aux: bool = False,
+        kim_local: bool = False,
+        knowledge_dim: int = 5,
     ):
         super().__init__()
         self.encoder = load_encoder(backbone)
@@ -348,6 +350,35 @@ class XAttnClassifier(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(head_in, 3),
             )
+
+        # Optional KIM-style local-inference block (Chen et al., 2018).  It is
+        # built only when asked for, so every existing state dict stays
+        # byte-identical when the flag is off (same pattern as hate_aux).
+        #
+        # The block reads the last cross-attention map, aligns the video states
+        # and the lexical relation vectors with it, then adds a gated residual:
+        #
+        #   ctx_i = sum_j A_ij h_v,j
+        #   k_i   = sum_j A_ij R_ij
+        #   m_i   = G([h_i; ctx_i; h_i-ctx_i; h_i*h_ctx_i; k_i])
+        #   h_i   = h_i + gamma * m_i
+        #
+        # gamma starts at zero, so a fresh KIM model is exactly the baseline at
+        # step 0; the gate decides how much of the matching branch to use.
+        self.kim_local = bool(kim_local)
+        self.kim_knowledge_dim = int(knowledge_dim)
+        if self.kim_local:
+            if self.kim_knowledge_dim < 1:
+                raise ValueError('knowledge_dim must be >= 1 when kim_local=True')
+            kim_in = 4 * d + self.kim_knowledge_dim
+            self.kim_proj = nn.Sequential(
+                nn.Linear(kim_in, d),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d, d),
+            )
+            self.kim_norm = nn.LayerNorm(d)
+            self.kim_gate = nn.Parameter(torch.zeros(1))
 
     def train(self, mode: bool = True):
         """`train(True)` also re-applies the frozen-module invariant.
@@ -429,7 +460,7 @@ class XAttnClassifier(nn.Module):
                 f'answers with zeros and the need_weights=True diagnostic path with NaN.')
 
     def forward(self, comment_ids, comment_mask, video_ids, video_mask,
-                return_attn: bool = False, return_aux: bool = False):
+                knowledge=None, return_attn: bool = False, return_aux: bool = False):
         # Before the video encoder or any cross-attention: an all-padded video row
         # has no valid key, and the diagnostic path turns that into NaN.
         self._validate_video_mask(video_mask)
@@ -439,12 +470,43 @@ class XAttnClassifier(nn.Module):
         kv_pad = video_mask == 0          # True = ignore this key
         q_pad = comment_mask == 0
         attn = []
-        for block in self.blocks:
-            if return_attn:
+        last_weights = None
+        n_blocks = len(self.blocks)
+        for i, block in enumerate(self.blocks):
+            need_weights = return_attn or (self.kim_local and i == n_blocks - 1)
+            if need_weights:
                 h_c, w = block(h_c, h_v, q_pad, kv_pad, return_attn=True)
-                attn.append(w)
+                if self.kim_local and i == n_blocks - 1:
+                    last_weights = w
+                if return_attn:
+                    attn.append(w)
             else:
                 h_c = block(h_c, h_v, q_pad, kv_pad)
+
+        if self.kim_local:
+            # The last cross-attention map is the alignment KIM's local
+            # inference needs: A_ij says which video token comment token i is
+            # looking at, and the lexical matrix says whether that pair has a
+            # WordNet relation.  Use the head-average map, matching KIM's
+            # single co-attention matrix.
+            if last_weights is None:
+                raise RuntimeError('kim_local=True but no last-block attention map was produced')
+            if knowledge is None:
+                knowledge = h_c.new_zeros(
+                    h_c.size(0), h_c.size(1), h_v.size(1), self.kim_knowledge_dim)
+            if knowledge.ndim != 4 or knowledge.size(-1) != self.kim_knowledge_dim:
+                raise ValueError(
+                    'knowledge must be [batch, comment_len, video_len, '
+                    f'{self.kim_knowledge_dim}], got {tuple(knowledge.shape)}')
+            if knowledge.size(0) != h_c.size(0):
+                raise ValueError('knowledge batch size does not match comment batch')
+            knowledge = knowledge.to(device=h_c.device, dtype=h_c.dtype)
+            weights = last_weights.mean(dim=1).to(h_c.dtype)   # (B, Lc, Lv)
+            ctx = torch.einsum('blm,bmd->bld', weights, h_v)
+            k_vec = torch.einsum('blm,blmr->blr', weights, knowledge)
+            match = torch.cat([h_c, ctx, h_c - ctx, h_c * ctx, k_vec], dim=-1)
+            match = self.kim_norm(self.kim_proj(match))
+            h_c = h_c + self.kim_gate * match
 
         # Attention pooling over the comment tokens.
         scores = (h_c @ self.pool_query) / math.sqrt(self.d_model)
